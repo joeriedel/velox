@@ -29,6 +29,12 @@
 
 #include <glog/logging.h>
 
+DEFINE_bool(
+    velox_ucx_exchange,
+    false,
+    "Enables the UCX-based GPU-to-GPU exchange between cuDF tasks, in "
+    "place of the HTTP-based exchange.");
+
 using namespace facebook::velox::cudf_velox;
 
 namespace facebook::velox::ucx_exchange {

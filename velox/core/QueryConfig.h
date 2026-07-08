@@ -473,6 +473,18 @@ class QueryConfig {
       32UL << 20,
       "Maximum size in bytes for the task's buffered output.")
 
+  /// Minimum rows to accumulate before the ucx-exchange UcxPartitionedOutput
+  /// operator flushes a chunk. See
+  /// UcxPartitionedOutput::kDefaultTargetRowsPerChunk.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchRows,
+      ucxPartitionedOutputBatchRows,
+      "ucx_partitioned_output_batch_rows",
+      int64_t,
+      10'000,
+      "Minimum rows to accumulate before the ucx-exchange "
+      "UcxPartitionedOutput operator flushes a chunk.")
+
   /// Preferred size of batches in bytes to be returned by operators from
   /// Operator::getOutput.
   VELOX_QUERY_CONFIG(

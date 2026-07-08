@@ -131,6 +131,26 @@ struct CudfConfig {
   /// "s" (seconds), "ms" (milliseconds), "us" (microseconds), "ns"
   /// (nanoseconds).
   cudf::type_id timestampUnit = cudf::type_id::TIMESTAMP_NANOSECONDS;
+
+  /// VLOG level for ucx-exchange modules (0=silent, 1-3=increasing
+  /// verbosity). Applied to every module in kUcxExchangeModules by
+  /// Communicator::initAndGet().
+  int exchangeLogLevel{0};
+
+  /// Enables the ucx-exchange same-process fast path (in-process
+  /// std::promise/future via IntraNodeTransferRegistry) when a source and
+  /// server share the same Communicator workerId. See Acceptor.cpp.
+  bool intraNodeExchange{true};
+
+  /// Enables UCXX endpoint error handling for ucx-exchange connections
+  /// (peer failures close the endpoint instead of aborting the worker).
+  /// See Communicator::connect() and Communicator::cStyleListenerCallback().
+  bool ucxxErrorHandling{true};
+
+  /// Uses UCXX's blocking progress mode (epoll-based wait) for the
+  /// ucx-exchange worker instead of a tight polling loop. See
+  /// Communicator::run().
+  bool ucxxBlockingPolling{false};
 };
 
 } // namespace facebook::velox::cudf_velox
