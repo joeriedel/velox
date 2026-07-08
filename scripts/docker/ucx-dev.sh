@@ -37,25 +37,42 @@ function enter {
     # already sets safe.directory for /velox at the system config level
     # (see ucx-exchange-dev.dockerfile), since the repo is owned by your
     # host UID but the container runs as root.
-    for dotfile in .zshrc .oh-my-zsh .p10k.zsh .gitconfig; do
+    # .ssh is mounted read-only: your agent has no loaded identities (git
+    # over SSH uses key files directly via the default IdentityFile
+    # behavior), so the client needs the actual keys/config/known_hosts,
+    # not just agent forwarding. File permissions carry over unchanged
+    # through the bind mount, which is what ssh's strict permission
+    # checks look at.
+    for dotfile in .zshrc .oh-my-zsh .p10k.zsh .gitconfig .ssh; do
       if [ -e "$HOME/$dotfile" ]; then
         dotfile_mounts+=(-v "$HOME/$dotfile:/root/$dotfile:ro,Z")
       fi
     done
 
-    # Forward the host's SSH agent so `git push`/`pull` over SSH can use
-    # your existing keys without copying them into the container.
+    # Also forward the host's SSH agent, in case it does have identities
+    # loaded in some other session.
     local ssh_mounts=()
     if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "${SSH_AUTH_SOCK}" ]; then
       ssh_mounts+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK:Z" -e SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
     fi
 
+    # Also bind-mount the repo at its host-identical absolute path (in
+    # addition to /velox). clangd running in-container (via
+    # ucx-clangd-wrapper.sh) needs the file paths it sees to match the
+    # paths the host-side editor opens, since compile_commands.json is
+    # rewritten to use host paths -- see gen-compile-commands.sh.
     podman run -d --rm --name "$CONTAINER" --hostname ucx-dev \
       --device nvidia.com/gpu=all --security-opt=label=disable \
       -e DISABLE_AUTO_UPDATE=true \
-      -v "$REPO_ROOT":/velox:Z -w /velox \
+      -v "$REPO_ROOT":/velox:Z -v "$REPO_ROOT":"$REPO_ROOT":Z -w /velox \
       "${dotfile_mounts[@]}" "${ssh_mounts[@]}" \
       "$IMAGE" sleep infinity
+
+    # The image only whitelists /velox as a safe.directory (see
+    # ucx-exchange-dev.dockerfile); whitelist the host-path mount too so
+    # git (and clangd's query-driver, which shells out to git) doesn't
+    # balk at it.
+    podman exec "$CONTAINER" git config --system --add safe.directory "$REPO_ROOT"
   fi
   exec podman exec -it -e TERM="$TERM" -e COLORTERM="${COLORTERM:-}" "$CONTAINER" zsh
 }

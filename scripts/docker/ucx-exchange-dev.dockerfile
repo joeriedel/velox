@@ -102,7 +102,11 @@ ENV CC=/opt/rh/gcc-toolset-12/root/bin/gcc \
 # glibc-langpack-en gives a real UTF-8 locale -- both needed for oh-my-zsh
 # themes (powerline/nerd-font glyphs, 256-color prompts) to render
 # correctly over `ucx-dev.sh enter`.
-RUN dnf install -y zsh ncurses-term glibc-langpack-en && \
+#
+# clang-tools-extra provides clangd, used for editor intellisense (see
+# scripts/docker/ucx-clangd-wrapper.sh) against the compile_commands.json
+# this environment's CMake configure produces.
+RUN dnf install -y zsh ncurses-term glibc-langpack-en clang-tools-extra && \
     { \
       echo 'source /opt/rh/gcc-toolset-14/enable'; \
       echo 'export CC=gcc CXX=g++'; \
