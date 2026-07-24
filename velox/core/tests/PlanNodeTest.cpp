@@ -411,6 +411,7 @@ TEST_F(PlanNodeTest, partitionedOutputNode) {
         {},
         1, // numPartitions
         true, // replicateNullsAndAny
+        false, // replicateNulls
         nullptr, // partitionFunctionSpec
         rowType_,
         serdeKind,
@@ -431,6 +432,7 @@ TEST_F(PlanNodeTest, partitionedOutputNode) {
         {},
         10, // numPartitions
         true, // replicateNullsAndAny
+        false, // replicateNulls
         partitionFunctionSpec,
         rowType_,
         serdeKind,

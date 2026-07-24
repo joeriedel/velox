@@ -41,7 +41,8 @@ class GroupbyAggregationRequestBuilder {
  public:
   GroupbyAggregationRequestBuilder(
       cudf::table_view const& tbl,
-      std::vector<cudf::groupby::aggregation_request>& requests);
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view stream);
 
   GroupbyAggregationResultRef addAggregationForColumn(
       uint32_t inputIndex,
@@ -64,6 +65,10 @@ class GroupbyAggregationRequestBuilder {
     return tableView_;
   }
 
+  rmm::cuda_stream_view stream() const {
+    return stream_;
+  }
+
   cudf::groupby::aggregation_request& aggregationRequest(
       const GroupbyAggregationResultRef& ref);
 
@@ -74,6 +79,7 @@ class GroupbyAggregationRequestBuilder {
 
   cudf::table_view tableView_;
   std::vector<cudf::groupby::aggregation_request>& requests_;
+  rmm::cuda_stream_view stream_;
   std::unordered_map<uint32_t, GroupbyAggregationResultRef>
       reusablePartialSums_;
 };

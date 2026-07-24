@@ -15,12 +15,17 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <optional>
+#include <utility>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -70,23 +75,41 @@ class CudfBatchConcatTest : public OperatorTestBase {
     return PlanBuilder(generator).localPartitionRoundRobin(sources).planNode();
   }
 
-  // Returns the per-operator-type stats for CudfBatchConcat within the given
-  // plan node, or nullptr if CudfBatchConcat wasn't inserted for that node.
-  const PlanNodeStats* getConcatStats(
+  // Returns CudfBatchConcat's input and output batch counts for the given plan
+  // node, or nullopt if CudfBatchConcat wasn't inserted for that node.
+  std::optional<std::pair<vector_size_t, vector_size_t>> getConcatVectorStats(
       const std::shared_ptr<Task>& task,
       const core::PlanNodeId& aggNodeId) {
     auto planStats = toPlanStats(task->taskStats());
     auto nodeIt = planStats.find(aggNodeId);
     if (nodeIt == planStats.end()) {
-      return nullptr;
+      return std::nullopt;
     }
     auto opIt = nodeIt->second.operatorStats.find("CudfBatchConcat");
     if (opIt == nodeIt->second.operatorStats.end()) {
-      return nullptr;
+      return std::nullopt;
     }
-    return opIt->second.get();
+    return std::pair{opIt->second->inputVectors, opIt->second->outputVectors};
   }
 };
+
+TEST_F(CudfBatchConcatTest, rejectsZeroRowCpuInput) {
+  auto input = makeRowVector({makeFlatVector<int32_t>(std::vector<int32_t>{})});
+  auto planNode = PlanBuilder().values({input}).project({"c0"}).planNode();
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "CudfBatchConcatTest",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  CudfBatchConcat concat(0, &driverCtx, planNode, 10);
+
+  VELOX_ASSERT_THROW(
+      concat.addInput(input), "CudfBatchConcat expects CudfVector input");
+}
 
 // Verifies that CudfBatchConcat is inserted before aggregation and reduces
 // the number of batches reaching the aggregation operator.
@@ -261,11 +284,10 @@ TEST_F(CudfBatchConcatTest, finalAggregationUsesDedicatedConcatThreshold) {
         std::vector<core::PlanNodePtr> partialSources;
         partialSources.reserve(vectors.size());
         for (const auto& vector : vectors) {
-          partialSources.push_back(
-              PlanBuilder(generator)
-                  .values({vector})
-                  .partialAggregation({"c0"}, {"sum(c1)"})
-                  .planNode());
+          partialSources.push_back(PlanBuilder(generator)
+                                       .values({vector})
+                                       .partialAggregation({"c0"}, {"sum(c1)"})
+                                       .planNode());
         }
 
         core::PlanNodeId finalAggNodeId;
@@ -279,14 +301,12 @@ TEST_F(CudfBatchConcatTest, finalAggregationUsesDedicatedConcatThreshold) {
             AssertQueryBuilder(duckDbQueryRunner_)
                 .plan(plan)
                 .maxDrivers(1)
-                .config(
-                    core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
+                .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
                 .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 
-        const auto* concatStats = getConcatStats(task, finalAggNodeId);
-        VELOX_CHECK_NOT_NULL(concatStats);
-        return std::pair{
-            concatStats->inputVectors, concatStats->outputVectors};
+        const auto concatStats = getConcatVectorStats(task, finalAggNodeId);
+        VELOX_CHECK(concatStats.has_value());
+        return concatStats.value();
       };
 
   const auto genericThresholdStats =
