@@ -37,7 +37,7 @@
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowAcceptor.h"
-#include "velox/experimental/ucx-exchange/UcxExchangeModules.h"
+#include "UcxExchangeModules.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #ifdef VELOX_ENABLE_CUDF
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -724,7 +724,7 @@ std::string Communicator::getWorkerAddress() const {
       [&]() { address = worker_->getAddress(); }, 3000000000);
   VELOX_CHECK(success, "Timed out reading UCX worker address");
   VELOX_CHECK_NOT_NULL(address, "Communicator worker address is null");
-  return address->getString();
+  return std::string{address->getStringView()};
 }
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
