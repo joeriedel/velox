@@ -21,6 +21,7 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -31,12 +32,21 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
 using namespace facebook::velox;
 using namespace facebook::velox::cudf_velox;
 using namespace facebook::velox::test;
+
+namespace facebook::velox::cudf_velox {
+
+rmm::device_async_resource_ref get_output_mr() {
+  return cudf::get_current_device_resource_ref();
+}
+
+} // namespace facebook::velox::cudf_velox
 
 namespace {
 
@@ -254,6 +264,107 @@ TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
   targetStream.view().synchronize();
   EXPECT_EQ(materialized->num_columns(), 1);
   EXPECT_EQ(materialized->num_rows(), 4);
+}
+
+TEST_F(CudfVectorTest, packedTableReleaseRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table = makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view(),
+      [&]() {
+        callbackSawBackingStorageReleased.store(
+            resource.wasDeallocated(packedData), std::memory_order_relaxed);
+      });
+
+  auto materialized = vector.release();
+
+  ASSERT_TRUE(callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
+}
+
+TEST_F(
+    CudfVectorTest,
+    packedTableDestructorRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table = makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  {
+    CudfVector vector(
+        pool_.get(),
+        ROW({"c0"}, {INTEGER()}),
+        packedTable->table.num_rows(),
+        std::move(packedTable),
+        stream.view(),
+        [&]() {
+          callbackSawBackingStorageReleased.store(
+              resource.wasDeallocated(packedData), std::memory_order_relaxed);
+        });
+  }
+
+  ASSERT_TRUE(callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+}
+
+TEST_F(CudfVectorTest, sharedOwnerReleaseDropsOwnerAfterMaterializing) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  std::shared_ptr<cudf::table> owner(
+      makeTable(
+          stream.view(), rmm::to_device_async_resource_ref_checked(&resource))
+          .release());
+  stream.view().synchronize();
+
+  auto tableView = owner->view();
+  const auto numRows = owner->num_rows();
+  const void* sourceData = owner->get_column(0).view().data<int32_t>();
+  resource.reset();
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      numRows,
+      tableView,
+      std::move(owner),
+      stream.view(),
+      0);
+
+  auto materialized = vector.release();
+
+  EXPECT_TRUE(resource.wasDeallocated(sourceData));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
 }
 
 } // namespace

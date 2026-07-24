@@ -40,12 +40,23 @@ RowTypePtr getConcatOutputType(
   return planNode->sources()[0]->outputType();
 }
 
+size_t resolveTargetRows(size_t targetRows) {
+  if (targetRows != 0) {
+    return targetRows;
+  }
+  const auto configuredTargetRows =
+      CudfConfig::getInstance().batchSizeMinThreshold;
+  VELOX_CHECK_GT(configuredTargetRows, 0);
+  return static_cast<size_t>(configuredTargetRows);
+}
+
 } // namespace
 
 CudfBatchConcat::CudfBatchConcat(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    std::shared_ptr<const core::PlanNode> planNode)
+    std::shared_ptr<const core::PlanNode> planNode,
+    size_t targetRows)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -57,9 +68,15 @@ CudfBatchConcat::CudfBatchConcat(
           std::nullopt,
           planNode),
       driverCtx_(driverCtx),
-      targetRows_(CudfConfig::getInstance().batchSizeMinThreshold) {}
+      targetRows_(resolveTargetRows(targetRows)) {
+  VELOX_CHECK_GT(targetRows_, 0);
+}
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
+  if (input->size() == 0) {
+    return;
+  }
+
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
 

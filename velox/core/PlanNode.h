@@ -32,6 +32,7 @@ namespace facebook::velox::core {
 
 class PlanNodeVisitor;
 class PlanNodeVisitorContext;
+class GroupedScalarFilterNode;
 
 using PlanNodeId = std::string;
 
@@ -758,6 +759,109 @@ class FilterNode : public PlanNode {
 };
 
 using FilterNodePtr = std::shared_ptr<const FilterNode>;
+
+class GroupedScalarFilterNode : public PlanNode {
+ public:
+  GroupedScalarFilterNode(
+      const PlanNodeId& id,
+      PlanNodePtr source,
+      std::string groupIdName,
+      int64_t groupedGroupId,
+      int64_t scalarGroupId,
+      std::string scalarValueName,
+      std::string scalarVariableName,
+      TypedExprPtr filter)
+      : PlanNode(id),
+        sources_{std::move(source)},
+        groupIdName_{std::move(groupIdName)},
+        groupedGroupId_{groupedGroupId},
+        scalarGroupId_{scalarGroupId},
+        scalarValueName_{std::move(scalarValueName)},
+        scalarVariableName_{std::move(scalarVariableName)},
+        filter_{std::move(filter)} {
+    VELOX_USER_CHECK(
+        filter_->type()->isBoolean(),
+        "GroupedScalarFilter expression must be of type BOOLEAN. Got {}.",
+        filter_->type()->toString());
+  }
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  RowTypePtr augmentedInputType() const {
+    auto names = sources_[0]->outputType()->names();
+    auto types = sources_[0]->outputType()->children();
+    names.push_back(scalarVariableName_);
+    types.push_back(sources_[0]->outputType()->findChild(scalarValueName_));
+    return ROW(std::move(names), std::move(types));
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
+      const override;
+
+  std::string_view name() const override {
+    return "GroupedScalarFilter";
+  }
+
+  const std::string& groupIdName() const {
+    return groupIdName_;
+  }
+
+  int64_t groupedGroupId() const {
+    return groupedGroupId_;
+  }
+
+  int64_t scalarGroupId() const {
+    return scalarGroupId_;
+  }
+
+  const std::string& scalarValueName() const {
+    return scalarValueName_;
+  }
+
+  const std::string& scalarVariableName() const {
+    return scalarVariableName_;
+  }
+
+  const TypedExprPtr& filter() const {
+    return filter_;
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+ private:
+  void addDetails(std::stringstream& stream) const override {
+    stream << "groupId: " << groupIdName_
+           << ", groupedGroupId: " << groupedGroupId_
+           << ", scalarGroupId: " << scalarGroupId_
+           << ", scalarValue: " << scalarValueName_
+           << ", scalarVariable: " << scalarVariableName_
+           << ", filter: " << filter_->toString();
+  }
+
+  void addSummaryDetails(
+      const std::string& indentation,
+      const PlanSummaryOptions& options,
+      std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
+  const std::string groupIdName_;
+  const int64_t groupedGroupId_;
+  const int64_t scalarGroupId_;
+  const std::string scalarValueName_;
+  const std::string scalarVariableName_;
+  const TypedExprPtr filter_;
+};
+
+using GroupedScalarFilterNodePtr =
+    std::shared_ptr<const GroupedScalarFilterNode>;
 
 class AbstractProjectNode : public PlanNode {
  public:
@@ -2622,12 +2726,14 @@ class LocalPartitionNode : public PlanNode {
       Type type,
       bool scaleWriter,
       PartitionFunctionSpecPtr partitionFunctionSpec,
-      std::vector<PlanNodePtr> sources)
+      std::vector<PlanNodePtr> sources,
+      bool replicateNulls = false)
       : PlanNode(id),
         type_{type},
         scaleWriter_(scaleWriter),
         sources_{std::move(sources)},
-        partitionFunctionSpec_{std::move(partitionFunctionSpec)} {
+        partitionFunctionSpec_{std::move(partitionFunctionSpec)},
+        replicateNulls_(replicateNulls) {
     VELOX_USER_CHECK_GT(
         sources_.size(),
         0,
@@ -2653,6 +2759,7 @@ class LocalPartitionNode : public PlanNode {
       type_ = other.type();
       scaleWriter_ = other.scaleWriter();
       partitionFunctionSpec_ = other.partitionFunctionSpec_;
+      replicateNulls_ = other.isReplicateNulls();
       sources_ = other.sources();
     }
 
@@ -2673,6 +2780,11 @@ class LocalPartitionNode : public PlanNode {
 
     Builder& partitionFunctionSpec(PartitionFunctionSpecPtr spec) {
       partitionFunctionSpec_ = std::move(spec);
+      return *this;
+    }
+
+    Builder& replicateNulls(bool replicateNulls) {
+      replicateNulls_ = replicateNulls;
       return *this;
     }
 
@@ -2698,7 +2810,8 @@ class LocalPartitionNode : public PlanNode {
           type_.value(),
           scaleWriter_.value(),
           partitionFunctionSpec_.value(),
-          sources_.value());
+          sources_.value(),
+          replicateNulls_.value());
     }
 
    private:
@@ -2706,6 +2819,7 @@ class LocalPartitionNode : public PlanNode {
     std::optional<LocalPartitionNode::Type> type_;
     std::optional<bool> scaleWriter_;
     std::optional<PartitionFunctionSpecPtr> partitionFunctionSpec_;
+    std::optional<bool> replicateNulls_{false};
     std::optional<std::vector<PlanNodePtr>> sources_;
   };
 
@@ -2752,6 +2866,10 @@ class LocalPartitionNode : public PlanNode {
     return *partitionFunctionSpec_;
   }
 
+  bool isReplicateNulls() const {
+    return replicateNulls_;
+  }
+
   std::string_view name() const override {
     return "LocalPartition";
   }
@@ -2767,6 +2885,7 @@ class LocalPartitionNode : public PlanNode {
   const bool scaleWriter_;
   const std::vector<PlanNodePtr> sources_;
   const PartitionFunctionSpecPtr partitionFunctionSpec_;
+  const bool replicateNulls_;
 };
 
 using LocalPartitionNodePtr = std::shared_ptr<const LocalPartitionNode>;
@@ -2787,6 +2906,7 @@ class PartitionedOutputNode : public PlanNode {
       const std::vector<TypedExprPtr>& keys,
       int numPartitions,
       bool replicateNullsAndAny,
+      bool replicateNulls,
       PartitionFunctionSpecPtr partitionFunctionSpec,
       RowTypePtr outputType,
       std::string serdeKind,
@@ -2811,6 +2931,7 @@ class PartitionedOutputNode : public PlanNode {
             keys,
             numPartitions,
             replicateNullsAndAny,
+            /*replicateNulls=*/false,
             std::move(partitionFunctionSpec),
             std::move(outputType),
             std::move(serdeKind),
@@ -2892,6 +3013,7 @@ class PartitionedOutputNode : public PlanNode {
       keys_ = other.keys();
       numPartitions_ = other.numPartitions();
       replicateNullsAndAny_ = other.isReplicateNullsAndAny();
+      replicateNulls_ = other.isReplicateNulls();
       partitionFunctionSpec_ = other.partitionFunctionSpecPtr();
       outputType_ = other.outputType();
       serdeKind_ = other.serdeKind();
@@ -2922,6 +3044,11 @@ class PartitionedOutputNode : public PlanNode {
 
     Builder& replicateNullsAndAny(bool replicate) {
       replicateNullsAndAny_ = replicate;
+      return *this;
+    }
+
+    Builder& replicateNulls(bool replicate) {
+      replicateNulls_ = replicate;
       return *this;
     }
 
@@ -2963,6 +3090,9 @@ class PartitionedOutputNode : public PlanNode {
           replicateNullsAndAny_.has_value(),
           "PartitionedOutputNode replicateNullsAndAny is not set");
       VELOX_USER_CHECK(
+          replicateNulls_.has_value(),
+          "PartitionedOutputNode replicateNulls is not set");
+      VELOX_USER_CHECK(
           partitionFunctionSpec_.has_value(),
           "PartitionedOutputNode partitionFunctionSpec is not set");
       VELOX_USER_CHECK(
@@ -2982,6 +3112,7 @@ class PartitionedOutputNode : public PlanNode {
           keys_.value(),
           numPartitions_.value(),
           replicateNullsAndAny_.value(),
+          replicateNulls_.value(),
           partitionFunctionSpec_.value(),
           outputType_.value(),
           serdeKind_.value(),
@@ -2995,6 +3126,7 @@ class PartitionedOutputNode : public PlanNode {
     std::optional<std::vector<TypedExprPtr>> keys_;
     std::optional<int> numPartitions_;
     std::optional<bool> replicateNullsAndAny_;
+    std::optional<bool> replicateNulls_{false};
     std::optional<PartitionFunctionSpecPtr> partitionFunctionSpec_;
     std::optional<RowTypePtr> outputType_;
     std::optional<std::string> serdeKind_;
@@ -3058,6 +3190,12 @@ class PartitionedOutputNode : public PlanNode {
     return replicateNullsAndAny_;
   }
 
+  /// Returns true if rows with null keys must be replicated to all
+  /// destinations without also replicating an arbitrary non-null row.
+  bool isReplicateNulls() const {
+    return replicateNulls_;
+  }
+
   const PartitionFunctionSpecPtr& partitionFunctionSpecPtr() const {
     return partitionFunctionSpec_;
   }
@@ -3083,6 +3221,7 @@ class PartitionedOutputNode : public PlanNode {
   const std::vector<TypedExprPtr> keys_;
   const int numPartitions_;
   const bool replicateNullsAndAny_;
+  const bool replicateNulls_;
   const PartitionFunctionSpecPtr partitionFunctionSpec_;
   const std::string serdeKind_;
   const std::string transportKind_;
@@ -3477,7 +3616,13 @@ class HashJoinNode : public AbstractJoinNode {
       RowTypePtr outputType,
       bool useHashTableCache = false,
       bool nullAsValue = false,
-      std::optional<std::string> cacheKey = std::nullopt)
+      std::optional<std::string> cacheKey = std::nullopt,
+      bool leftKeysUnique = false,
+      bool rightKeysUnique = false,
+      bool leftKeysNonNull = false,
+      bool rightKeysNonNull = false,
+      bool leftKeysCoveredByRightKeys = false,
+      bool rightKeysCoveredByLeftKeys = false)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3490,7 +3635,13 @@ class HashJoinNode : public AbstractJoinNode {
         nullAware_{nullAware},
         nullAsValue_{nullAsValue},
         useHashTableCache_{useHashTableCache},
-        cacheKey_{std::move(cacheKey)} {
+        cacheKey_{std::move(cacheKey)},
+        leftKeysUnique_{leftKeysUnique},
+        rightKeysUnique_{rightKeysUnique},
+        leftKeysNonNull_{leftKeysNonNull},
+        rightKeysNonNull_{rightKeysNonNull},
+        leftKeysCoveredByRightKeys_{leftKeysCoveredByRightKeys},
+        rightKeysCoveredByLeftKeys_{rightKeysCoveredByLeftKeys} {
     validate();
 
     VELOX_USER_CHECK(
@@ -3534,6 +3685,12 @@ class HashJoinNode : public AbstractJoinNode {
       nullAsValue_ = other.isNullAsValue();
       useHashTableCache_ = other.useHashTableCache();
       cacheKey_ = other.cacheKey();
+      leftKeysUnique_ = other.leftKeysUnique();
+      rightKeysUnique_ = other.rightKeysUnique();
+      leftKeysNonNull_ = other.leftKeysNonNull();
+      rightKeysNonNull_ = other.rightKeysNonNull();
+      leftKeysCoveredByRightKeys_ = other.leftKeysCoveredByRightKeys();
+      rightKeysCoveredByLeftKeys_ = other.rightKeysCoveredByLeftKeys();
     }
 
     Builder& nullAware(bool value) {
@@ -3553,6 +3710,36 @@ class HashJoinNode : public AbstractJoinNode {
 
     Builder& cacheKey(std::optional<std::string> value) {
       cacheKey_ = std::move(value);
+      return *this;
+    }
+
+    Builder& leftKeysUnique(bool value) {
+      leftKeysUnique_ = value;
+      return *this;
+    }
+
+    Builder& rightKeysUnique(bool value) {
+      rightKeysUnique_ = value;
+      return *this;
+    }
+
+    Builder& leftKeysNonNull(bool value) {
+      leftKeysNonNull_ = value;
+      return *this;
+    }
+
+    Builder& rightKeysNonNull(bool value) {
+      rightKeysNonNull_ = value;
+      return *this;
+    }
+
+    Builder& leftKeysCoveredByRightKeys(bool value) {
+      leftKeysCoveredByRightKeys_ = value;
+      return *this;
+    }
+
+    Builder& rightKeysCoveredByLeftKeys(bool value) {
+      rightKeysCoveredByLeftKeys_ = value;
       return *this;
     }
 
@@ -3585,7 +3772,13 @@ class HashJoinNode : public AbstractJoinNode {
           outputType_.value(),
           useHashTableCache_.value_or(false),
           nullAsValue_.value_or(false),
-          cacheKey_);
+          cacheKey_,
+          leftKeysUnique_.value_or(false),
+          rightKeysUnique_.value_or(false),
+          leftKeysNonNull_.value_or(false),
+          rightKeysNonNull_.value_or(false),
+          leftKeysCoveredByRightKeys_.value_or(false),
+          rightKeysCoveredByLeftKeys_.value_or(false));
     }
 
    private:
@@ -3593,6 +3786,12 @@ class HashJoinNode : public AbstractJoinNode {
     std::optional<bool> nullAsValue_;
     std::optional<bool> useHashTableCache_;
     std::optional<std::string> cacheKey_;
+    std::optional<bool> leftKeysUnique_;
+    std::optional<bool> rightKeysUnique_;
+    std::optional<bool> leftKeysNonNull_;
+    std::optional<bool> rightKeysNonNull_;
+    std::optional<bool> leftKeysCoveredByRightKeys_;
+    std::optional<bool> rightKeysCoveredByLeftKeys_;
   };
 
   std::string_view name() const override {
@@ -3636,6 +3835,34 @@ class HashJoinNode : public AbstractJoinNode {
     return cacheKey_;
   }
 
+  /// Returns true when the planner has proven the left/probe join keys unique.
+  bool leftKeysUnique() const {
+    return leftKeysUnique_;
+  }
+
+  /// Returns true when the planner has proven the right/build join keys unique.
+  bool rightKeysUnique() const {
+    return rightKeysUnique_;
+  }
+
+  /// Returns true when the planner has proven the left/probe join keys non-null.
+  bool leftKeysNonNull() const {
+    return leftKeysNonNull_;
+  }
+
+  /// Returns true when the planner has proven the right/build join keys non-null.
+  bool rightKeysNonNull() const {
+    return rightKeysNonNull_;
+  }
+
+  bool leftKeysCoveredByRightKeys() const {
+    return leftKeysCoveredByRightKeys_;
+  }
+
+  bool rightKeysCoveredByLeftKeys() const {
+    return rightKeysCoveredByLeftKeys_;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -3647,6 +3874,12 @@ class HashJoinNode : public AbstractJoinNode {
   const bool nullAsValue_;
   const bool useHashTableCache_;
   const std::optional<std::string> cacheKey_;
+  const bool leftKeysUnique_;
+  const bool rightKeysUnique_;
+  const bool leftKeysNonNull_;
+  const bool rightKeysNonNull_;
+  const bool leftKeysCoveredByRightKeys_;
+  const bool rightKeysCoveredByLeftKeys_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;
@@ -6396,6 +6629,12 @@ class PlanNodeVisitor {
 
   virtual void visit(const FilterNode& node, PlanNodeVisitorContext& ctx)
       const = 0;
+
+  virtual void visit(
+      const GroupedScalarFilterNode& node,
+      PlanNodeVisitorContext& ctx) const {
+    visit(static_cast<const PlanNode&>(node), ctx);
+  }
 
   virtual void visit(const GroupIdNode& node, PlanNodeVisitorContext& ctx)
       const = 0;

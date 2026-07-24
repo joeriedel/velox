@@ -20,6 +20,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
@@ -32,6 +34,9 @@ namespace facebook::velox::cudf_velox {
     std::vector<std::unique_ptr<cudf::table>> tables,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
+
+[[nodiscard]] std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType);
 
 /**
  * @brief Concatenates multiple CudfVectors into a single cudf::table.

@@ -17,45 +17,52 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
-
-#include "velox/exec/Operator.h"
-
-#include <cstddef>
-#include <queue>
 
 namespace facebook::velox::cudf_velox {
 
-class CudfBatchConcat : public CudfOperatorBase {
+class CudfGroupedScalarFilter : public CudfOperatorBase {
  public:
-  CudfBatchConcat(
+  CudfGroupedScalarFilter(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      std::shared_ptr<const core::PlanNode> planNode,
-      size_t targetRows = 0);
+      std::shared_ptr<const core::GroupedScalarFilterNode> planNode);
+
+  void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_ && outputQueue_.empty() &&
-        currentNumRows_ < targetRows_;
+    return !noMoreInput_;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;
   }
 
-  bool isFinished() override;
+  bool isFinished() override {
+    return finished_;
+  }
 
  protected:
   void doAddInput(RowVectorPtr input) override;
+
   RowVectorPtr doGetOutput() override;
 
+  void doClose() override {
+    Operator::close();
+    filterEvaluator_.reset();
+    inputs_.clear();
+  }
+
  private:
-  exec::DriverCtx* const driverCtx_;
-  std::vector<CudfVectorPtr> buffer_;
-  std::queue<CudfVectorPtr> outputQueue_;
-  size_t currentNumRows_{0};
-  const size_t targetRows_{0};
+  const std::shared_ptr<const core::GroupedScalarFilterNode> planNode_;
+  const RowTypePtr augmentedInputType_;
+  const column_index_t groupIdChannel_;
+  const column_index_t scalarValueChannel_;
+
+  CudfExpressionPtr filterEvaluator_;
+  std::vector<CudfVectorPtr> inputs_;
+  bool finished_{false};
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -90,6 +90,11 @@ class UcxPartitionedOutput : public exec::Operator,
       rmm::cuda_stream_view stream,
       int64_t estimatedBytes);
 
+  void enqueueReplicatedNullRows(
+      cudf::table_view nullRows,
+      const std::vector<cudf::size_type>& nativeNullPartitionOffsets,
+      rmm::cuda_stream_view stream);
+
   // Splits the cudf table view into equal sizes. This is used when
   // RoundRobin partitioning is requested but round robin on a
   // row-by-row basis is not meaningful for UCX exchange.
@@ -179,6 +184,7 @@ class UcxPartitionedOutput : public exec::Operator,
   std::vector<column_index_t> partitionKeyIndices_;
   const size_t numPartitions_;
   const core::PartitionedOutputNode::Kind kind_;
+  const bool replicateNulls_;
 
   const int pipelineId_;
   const int driverId_;

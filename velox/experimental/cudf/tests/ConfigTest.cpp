@@ -20,6 +20,21 @@
 
 namespace facebook::velox::cudf_velox::test {
 
+TEST(ConfigTest, Defaults) {
+  CudfConfig config;
+  ASSERT_EQ(config.distinctHashJoinEnabled, true);
+  ASSERT_EQ(config.probeUniqueInnerJoinEnabled, false);
+}
+
+TEST(ConfigTest, DistinctHashJoinCanBeDisabled) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "false"}};
+
+  CudfConfig config;
+  config.initialize(std::move(options));
+  ASSERT_EQ(config.distinctHashJoinEnabled, false);
+}
+
 TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
@@ -28,6 +43,10 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfBatchSizeMinThreshold, "50000000"},
+      {CudfConfig::kCudfFinalAggregationBatchSizeMinThreshold, "150000000"},
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "true"},
+      {CudfConfig::kCudfProbeUniqueInnerJoinEnabled, "true"},
       {CudfConfig::kCudfExchange, "true"},
       {CudfConfig::kCudfExchangeServerPort, "12345"},
       {CudfConfig::kCudfIntraNodeExchange, "false"},
@@ -44,6 +63,11 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.batchSizeMinThreshold, 50000000);
+  ASSERT_TRUE(config.finalAggregationBatchSizeMinThreshold.has_value());
+  ASSERT_EQ(config.finalAggregationBatchSizeMinThreshold.value(), 150000000);
+  ASSERT_EQ(config.distinctHashJoinEnabled, true);
+  ASSERT_EQ(config.probeUniqueInnerJoinEnabled, true);
   ASSERT_EQ(config.exchange, true);
   ASSERT_EQ(config.exchangeServerPort, 12345);
   ASSERT_EQ(config.intraNodeExchange, false);
