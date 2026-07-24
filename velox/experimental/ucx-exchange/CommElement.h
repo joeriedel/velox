@@ -15,6 +15,11 @@
  */
 #pragma once
 
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 
 // The CommElement is the abstract base class of both the
@@ -29,11 +34,18 @@ class CommElement {
  public:
   CommElement(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef)
-      : communicator_{communicator}, endpointRef_{endpointRef} {}
+      std::shared_ptr<EndpointRef> endpointRef,
+      bool coalesceWorkQueueEntries = false)
+      : communicator_{communicator},
+        endpointRef_{endpointRef},
+        coalesceWorkQueueEntries_{coalesceWorkQueueEntries} {}
 
-  CommElement(const std::shared_ptr<Communicator> communicator)
-      : communicator_{communicator}, endpointRef_{nullptr} {}
+  CommElement(
+      const std::shared_ptr<Communicator> communicator,
+      bool coalesceWorkQueueEntries = false)
+      : communicator_{communicator},
+        endpointRef_{nullptr},
+        coalesceWorkQueueEntries_{coalesceWorkQueueEntries} {}
 
   virtual ~CommElement() = default;
 
@@ -45,8 +57,50 @@ class CommElement {
   // or the communicator is finished.
   virtual void close() = 0;
 
+  /// Per-element process exclusion. The Communicator's primary dispatch
+  /// loop calls process() under this mutex; if close() or endpoint cleanup
+  /// already owns it, dispatch pushes the element back to the queue and
+  /// moves on. Source/server state machines assume this single-owner
+  /// process path.
+  ///
+  /// Recursive because close() can be reached from process() and from
+  /// endpoint cleanup paths; both use the same per-element exclusion.
+  std::recursive_mutex processMutex_;
+
+  bool markQueued() {
+    if (!coalesceWorkQueueEntries_) {
+      return true;
+    }
+    bool expected = false;
+    return queued_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel);
+  }
+
+  void clearQueued() {
+    if (coalesceWorkQueueEntries_) {
+      queued_.store(false, std::memory_order_release);
+    }
+  }
+
  protected:
+  using StateEvent = std::function<void()>;
+
+  /// Queue a state-machine event from an arbitrary thread. UCX callbacks
+  /// use this to hand completion work back to process(), preserving the
+  /// single-owner state-machine invariant.
+  void enqueueStateEvent(std::shared_ptr<CommElement> self, StateEvent event);
+
+  /// Runs pending events. Must be called by process() while processMutex_
+  /// is held by the Communicator dispatch loop.
+  void drainStateEvents();
+
   const std::shared_ptr<Communicator> communicator_;
   std::shared_ptr<EndpointRef> endpointRef_;
+
+ private:
+  const bool coalesceWorkQueueEntries_;
+  std::atomic<bool> queued_{false};
+  std::mutex stateEventMutex_;
+  std::deque<StateEvent> stateEvents_;
 };
 } // namespace facebook::velox::ucx_exchange

@@ -25,7 +25,7 @@
 #include <future>
 #include <memory>
 #include <tuple>
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
@@ -89,12 +89,20 @@ class UcxExchangeServer
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
+  /// Handles data becoming available from the output queue.
+  void onDataAvailable(std::shared_ptr<cudf::packed_columns> data);
+
+  /// Error handler after a metadata send fails.
+  void metadataSendFailed(ucs_status_t status, const std::string& taskId);
+
   /// @brief Completion handler after data has been sent.
-  void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
+  void sendComplete(ucs_status_t status);
 
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
   void onIntraNodeRetrieveComplete();
+
+  void releaseIntraNodeInFlightBytes();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -117,10 +125,8 @@ class UcxExchangeServer
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
-  /// Protects dataPtr_. Must be recursive because sendData() holds the lock
-  /// when calling tagSend(), and for small messages UCX completes inline via
-  /// its fast-completion path, firing the sendComplete() callback on the same
-  /// thread while the lock is still held.
+  /// Protects dataPtr_ across queue callbacks, state-machine dispatch, and
+  /// close/error cleanup paths.
   std::recursive_mutex dataMutex_;
   std::atomic<bool> closed_{false};
 
@@ -149,7 +155,8 @@ class UcxExchangeServer
   std::vector<std::shared_ptr<ucxx::Request>> completedRequests_;
 
   std::chrono::time_point<std::chrono::high_resolution_clock> sendStart_;
-  std::size_t bytes_;
+  std::size_t bytes_{0};
+  bool intraNodeBytesInFlight_{false};
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
 };

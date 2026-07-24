@@ -78,6 +78,10 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   endif()
 endif()
 
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  add_subdirectory(experimental/ucx-exchange)
+endif()
+
 if(VELOX_ENABLE_TORCHWAVE)
   add_subdirectory(experimental/torchwave)
 endif()

@@ -20,7 +20,7 @@
 #include "velox/exec/ExchangeClient.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/OperatorType.h"
-#include "velox/exec/SerializedPage.h"
+#include "velox/exec/OutputBufferManager.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/serializers/RowSerializer.h"
 
@@ -64,6 +64,14 @@ class Exchange : public SourceOperator {
   BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override;
+
+  std::shared_ptr<ExchangeClient> releaseExchangeClient() {
+    return std::move(exchangeClient_);
+  }
+
+  void resetExchangeClient() {
+    exchangeClient_.reset();
+  }
 
  protected:
   virtual VectorSerde* getSerde();

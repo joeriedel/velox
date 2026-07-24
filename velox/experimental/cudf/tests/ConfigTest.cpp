@@ -27,7 +27,14 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfExchange, "true"},
+      {CudfConfig::kCudfExchangeServerPort, "12345"},
+      {CudfConfig::kCudfIntraNodeExchange, "false"},
+      {CudfConfig::kCudfPartitionedOutputBatchRows, "123456"},
+      {CudfConfig::kCudfExchangeLogLevel, "7"},
+      {CudfConfig::kCudfUcxxBlockingPolling, "true"},
+      {CudfConfig::kCudfUcxxErrorHandling, "false"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -37,5 +44,12 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.exchange, true);
+  ASSERT_EQ(config.exchangeServerPort, 12345);
+  ASSERT_EQ(config.intraNodeExchange, false);
+  ASSERT_EQ(config.partitionedOutputBatchRows, 123456);
+  ASSERT_EQ(config.exchangeLogLevel, 7);
+  ASSERT_EQ(config.ucxxBlockingPolling, true);
+  ASSERT_EQ(config.ucxxErrorHandling, false);
 }
 } // namespace facebook::velox::cudf_velox::test

@@ -40,14 +40,14 @@ class ExchangeClient : public std::enable_shared_from_this<ExchangeClient> {
       bool lazyFetching = false)
       : taskId_{std::move(taskId)},
         destination_(destination),
+        numberOfConsumers_(numberOfConsumers),
         maxQueuedBytes_{maxQueuedBytes},
         requestDataSizesMaxWaitSec_{requestDataSizesMaxWaitSec},
         pool_(pool),
         executor_(executor),
-        queue_(
-            std::make_shared<ExchangeQueue>(
-                numberOfConsumers,
-                minOutputBatchBytes)),
+        queue_(std::make_shared<ExchangeQueue>(
+            numberOfConsumers,
+            minOutputBatchBytes)),
         // See comment in 'pickSourcesToRequestLocked' for why this is needed
         // for 'minOutputBatchBytes_'. Note: ExchangeQueue does not need max(1,
         // minOutputBatchBytes) because for 'MergeExchangeSource', we want
@@ -122,6 +122,14 @@ class ExchangeClient : public std::enable_shared_from_this<ExchangeClient> {
     return remoteTaskIds_;
   }
 
+  int getDestination() const {
+    return destination_;
+  }
+
+  uint32_t getNumberOfConsumers() const {
+    return numberOfConsumers_;
+  }
+
  private:
   struct RequestSpec {
     std::shared_ptr<ExchangeSource> source;
@@ -170,6 +178,7 @@ class ExchangeClient : public std::enable_shared_from_this<ExchangeClient> {
   // Handy for ad-hoc logging.
   const std::string taskId_;
   const int destination_;
+  const int32_t numberOfConsumers_;
   const int64_t maxQueuedBytes_;
   const std::chrono::seconds requestDataSizesMaxWaitSec_;
 

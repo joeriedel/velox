@@ -258,6 +258,16 @@ TEST_F(PlanNodeSerdeTest, exchange) {
   }
 }
 
+TEST_F(PlanNodeSerdeTest, exchangeTransportKind) {
+  auto plan = PlanBuilder()
+                  .exchange(
+                      ROW({"a", "b", "c"}, {BIGINT(), DOUBLE(), VARCHAR()}),
+                      "Presto",
+                      std::string{core::TransportKind::kUcx})
+                  .planNode();
+  testSerde(plan);
+}
+
 TEST_F(PlanNodeSerdeTest, filter) {
   auto plan = PlanBuilder().values({data_}).filter("c0 > 100").planNode();
   testSerde(plan);
@@ -341,6 +351,17 @@ TEST_F(PlanNodeSerdeTest, mergeExchange) {
                     .planNode();
     testSerde(plan);
   }
+}
+
+TEST_F(PlanNodeSerdeTest, mergeExchangeTransportKind) {
+  auto plan = PlanBuilder()
+                  .mergeExchange(
+                      ROW({"a", "b", "c"}, {BIGINT(), DOUBLE(), VARCHAR()}),
+                      {"a DESC", "b NULLS FIRST"},
+                      "Presto",
+                      std::string{core::TransportKind::kUcx})
+                  .planNode();
+  testSerde(plan);
 }
 
 TEST_F(PlanNodeSerdeTest, localMerge) {
