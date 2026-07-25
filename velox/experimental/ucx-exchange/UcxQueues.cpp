@@ -1174,6 +1174,25 @@ void UcxOutputQueue::terminate() {
   }
 }
 
+std::string UcxOutputQueue::toString() {
+  std::stringstream out;
+  std::lock_guard<std::mutex> l(mutex_);
+  out << "[UcxOutputQueue task="
+      << (task_ ? task_->taskId() : "<uninitialized>") << " queues=";
+  for (const auto& queue : queues_) {
+    out << (queue ? queue->toString() : "<deleted>") << ", ";
+  }
+  out << " reservedBytes=" << reservedBytes_
+      << ", transferReservedBytes=" << transferReservedBytesLocked()
+      << ", queuedBytes=" << queuedBytes_
+      << ", queuedPackedColumns=" << queuedPackedColumns_
+      << ", inFlightBytes=" << inFlightBytes_
+      << ", inFlightPackedColumns=" << inFlightPackedColumns_
+      << ", numFinished=" << numFinished_ << "/" << numDrivers_
+      << ", atEnd=" << atEnd_ << ", noMoreQueues=" << noMoreQueues_ << "]";
+  return out.str();
+}
+
 exec::OutputBuffer::Stats UcxOutputQueue::stats() {
   std::lock_guard<std::mutex> l(mutex_);
   std::vector<UcxDestinationQueue::Stats> queueStats;
