@@ -33,11 +33,11 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include "UcxExchangeModules.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowAcceptor.h"
-#include "UcxExchangeModules.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #ifdef VELOX_ENABLE_CUDF
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -358,7 +358,11 @@ void Communicator::run() {
         {}, UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_WAKEUP);
   }
 
-  worker_ = context_->createWorker(false);
+  // UCXX progress runs on a dedicated thread below, while exchange state
+  // machines submit requests from this communicator thread. Delay request
+  // submission onto the progress thread so RequestTag::request(),
+  // publishRequest(), and process() cannot race a completion callback.
+  worker_ = context_->createWorker(true);
 
   listener_ = worker_->createListener(
       port_, Communicator::cStyleListenerCallback, this);
