@@ -191,20 +191,13 @@ UcxOutputQueue::UcxOutputQueue(
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
-    initialized_.store(true, std::memory_order_release);
   } // else: maxSize_ and continueSize_ will be set once the task is created and
     // initialize called.
-  // create a queue for each destination.
-  queues_.reserve(numDestinations);
-  transferReservedBytes_.reserve(numDestinations);
-  transferPromises_.reserve(numDestinations);
-  transferWindowBytes_.reserve(numDestinations);
-  for (int i = 0; i < numDestinations; ++i) {
-    // create the destination queues inside the vector using emplace_back.
-    queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
-    transferReservedBytes_.push_back(0);
-    transferPromises_.emplace_back();
-    transferWindowBytes_.push_back(0);
+  if (numDestinations > 0) {
+    addOutputBuffersLocked(numDestinations);
+  }
+  if (task_) {
+    initialized_.store(true, std::memory_order_release);
   }
 }
 
@@ -227,24 +220,52 @@ bool UcxOutputQueue::initialize(
   // needs task/kind to choose the intra-node path; getData() takes mutex_ and
   // waits for any queue expansion in this function to finish.
   initialized_.store(true, std::memory_order_release);
-  // create additional queues if there are more destinations.
-  for (int i = queues_.size(); i < numDestinations; ++i) {
-    // create the destination queues inside the vector using emplace_back.
-    queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
-    transferReservedBytes_.push_back(0);
-    transferPromises_.emplace_back();
-    transferWindowBytes_.push_back(0);
+  if (numDestinations > queues_.size()) {
+    addOutputBuffersLocked(numDestinations);
   }
-  while (transferReservedBytes_.size() < queues_.size()) {
-    transferReservedBytes_.push_back(0);
-  }
-  while (transferPromises_.size() < queues_.size()) {
-    transferPromises_.emplace_back();
-  }
-  while (transferWindowBytes_.size() < queues_.size()) {
-    transferWindowBytes_.push_back(0);
-  }
+  VELOX_CHECK_EQ(transferReservedBytes_.size(), queues_.size());
+  VELOX_CHECK_EQ(transferPromises_.size(), queues_.size());
+  VELOX_CHECK_EQ(transferWindowBytes_.size(), queues_.size());
   return true;
+}
+
+void UcxOutputQueue::addOutputBuffersLocked(int numBuffers) {
+  using Kind = core::PartitionedOutputNode::Kind;
+
+  VELOX_CHECK_GE(numBuffers, 0);
+  VELOX_CHECK_GT(numBuffers, queues_.size());
+  VELOX_CHECK(!noMoreQueues_, "Cannot add destinations after noMoreBuffers");
+  VELOX_CHECK_EQ(transferReservedBytes_.size(), queues_.size());
+  VELOX_CHECK_EQ(transferPromises_.size(), queues_.size());
+  VELOX_CHECK_EQ(transferWindowBytes_.size(), queues_.size());
+
+  queues_.reserve(numBuffers);
+  transferReservedBytes_.reserve(numBuffers);
+  transferPromises_.reserve(numBuffers);
+  transferWindowBytes_.reserve(numBuffers);
+  if (kind_ == Kind::kBroadcast && !dataToBroadcast_.empty()) {
+    updateTotalQueuedBytesMsLocked();
+  }
+  for (int32_t i = queues_.size(); i < numBuffers; ++i) {
+    auto buffer = std::make_unique<UcxDestinationQueue>();
+    if (kind_ == Kind::kBroadcast) {
+      for (const auto& data : dataToBroadcast_) {
+        buffer->enqueueBack(data);
+        // Each backfilled payload will be dequeued and accounted independently
+        // for this destination.
+        queuedBytes_ += data->gpu_data->size();
+        queuedPackedColumns_++;
+      }
+    }
+    // Preserve FIFO ordering: retained broadcast payloads precede EOS.
+    if (atEnd_) {
+      buffer->enqueueBack(nullptr);
+    }
+    queues_.emplace_back(std::move(buffer));
+    transferReservedBytes_.push_back(0);
+    transferPromises_.emplace_back();
+    transferWindowBytes_.push_back(0);
+  }
 }
 
 void UcxOutputQueue::updateNumDrivers(uint32_t newNumDrivers) {
@@ -708,22 +729,21 @@ void UcxOutputQueue::releaseInFlightBytes(
 }
 
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
+  VELOX_CHECK_GE(destination, 0);
   UcxDestinationQueue::Data data;
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
-    // If the queue doesn't exist yet, create an empty queue to store
-    // the notify callback. The queue will eventually be initialized when
-    // the task is being created.
-    for (int i = queues_.size(); i <= destination; ++i) {
-      // create the destination queues inside the vector using emplace_back.
-      queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
-      transferReservedBytes_.push_back(0);
-      transferPromises_.emplace_back();
-      transferWindowBytes_.push_back(0);
-      if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary && atEnd_) {
-        queues_.back()->enqueueBack(nullptr);
-      }
+    if (destination >= queues_.size()) {
+      VELOX_CHECK_LT(destination, std::numeric_limits<int>::max());
+      // An uninitialized placeholder has the default partitioned kind, but
+      // must still grow to hold early getData() callbacks. Once task metadata
+      // is published, partitioned output has a fixed destination count.
+      VELOX_CHECK(
+          !isInitialized() ||
+              kind_ != core::PartitionedOutputNode::Kind::kPartitioned,
+          "Cannot add destinations to initialized partitioned output");
+      addOutputBuffersLocked(destination + 1);
     }
     auto* queue = queues_[destination].get();
     // queue can be nullptr here if the task has terminated and results
@@ -1028,44 +1048,21 @@ bool UcxOutputQueue::isFinishedLocked() {
 
 void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   using Kind = core::PartitionedOutputNode::Kind;
-  if (kind_ == Kind::kPartitioned) {
-    std::lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK_EQ(queues_.size(), numBuffers);
-    VELOX_CHECK(noMoreBuffers);
-    noMoreQueues_ = true;
-    return;
-  }
-
-  VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
-  bool isFinished;
+  bool isFinished{false};
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_GE(numBuffers, 0);
+    if (kind_ == Kind::kPartitioned) {
+      VELOX_CHECK_EQ(queues_.size(), numBuffers);
+      VELOX_CHECK(noMoreBuffers);
+      noMoreQueues_ = true;
+      return;
+    }
+
+    VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
 
     if (numBuffers > queues_.size()) {
-      int32_t numNewBuffers = numBuffers - queues_.size();
-      queues_.reserve(numBuffers);
-      for (int32_t i = 0; i < numNewBuffers; ++i) {
-        auto buffer = std::make_unique<UcxDestinationQueue>();
-        if (kind_ == Kind::kBroadcast) {
-          // Backfill new destinations with previously broadcast data.
-          for (const auto& data : dataToBroadcast_) {
-            buffer->enqueueBack(data);
-            // Account for backfilled data in queuedBytes_ so that dequeue
-            // decrements don't drive it negative.
-            queuedBytes_ += data->gpu_data->size();
-            queuedPackedColumns_++;
-          }
-        }
-        // No backfill for arbitrary. New consumers only get future data, or an
-        // end marker if production already completed.
-        if (atEnd_) {
-          buffer->enqueueBack(nullptr);
-        }
-        queues_.emplace_back(std::move(buffer));
-        transferReservedBytes_.push_back(0);
-        transferPromises_.emplace_back();
-        transferWindowBytes_.push_back(0);
-      }
+      addOutputBuffersLocked(numBuffers);
     }
 
     if (!noMoreBuffers) {

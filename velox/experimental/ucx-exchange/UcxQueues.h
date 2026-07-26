@@ -341,6 +341,11 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // be unblocked.
   static constexpr int32_t kContinuePct = 90;
 
+  /// Grows queues_ to numBuffers during construction or while holding mutex_.
+  /// For broadcast output, each new destination receives all retained payloads
+  /// before a possible end-of-stream marker.
+  void addOutputBuffersLocked(int numBuffers);
+
   // Methods that update the statistics.
   void updateStatsWithEnqueuedLocked(int64_t bytes, int64_t rows);
 
