@@ -133,7 +133,8 @@ class Communicator {
       const std::shared_ptr<EndpointRef>& endpointRef,
       uint32_t peerHostIdHash) const;
 
-  /// Returns this process' serialized UCX worker address.
+  /// Returns this process' cached serialized UCX worker address, or an empty
+  /// string when worker-address endpoints are unavailable.
   [[nodiscard]] std::string getWorkerAddress() const;
 
   /// Returns a stable same-host transport identity hash. Equal non-zero values
@@ -213,6 +214,11 @@ class Communicator {
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
   std::shared_ptr<ucxx::Listener> listener_;
+  // The UCX worker address is immutable after worker creation. Cache it while
+  // starting the communicator so every CPU exchange handshake does not have
+  // to schedule another callback on the UCXX progress thread.
+  mutable std::mutex workerAddressMutex_;
+  std::string workerAddress_;
   uint16_t port_;
   std::string coordinatorURL_;
   std::atomic<bool> running_{false};
