@@ -1272,17 +1272,18 @@ void Task::createAndStartDrivers(uint32_t concurrentSplitGroups) {
 }
 
 void Task::initializePartitionOutput() {
-  VELOX_CHECK(
-      isRunningLocked(),
-      "Task {} has already been terminated before start: {}",
-      taskId_,
-      errorMessageLocked());
+  std::unique_lock<std::mutex> outputBufferUpdateLock(outputBufferUpdateMutex_);
 
   std::shared_ptr<const core::PartitionedOutputNode> partitionedOutputNode{
       nullptr};
   int numOutputDrivers{0};
   {
     std::unique_lock<std::timed_mutex> l(mutex_);
+    VELOX_CHECK(
+        isRunningLocked(),
+        "Task {} has already been terminated before start: {}",
+        taskId_,
+        errorMessageLocked());
     const auto numPipelines = driverFactories_.size();
     exchangeClients_.resize(numPipelines);
 
@@ -1318,26 +1319,106 @@ void Task::initializePartitionOutput() {
     }
   }
 
-  if (partitionedOutputNode != nullptr) {
-    VELOX_CHECK(hasPartitionedOutput());
-    VELOX_CHECK_GT(numOutputDrivers, 0);
-    const auto& transport = partitionedOutputNode->transportKind();
-    auto entry = OutputTransportRegistry::tryGet(*queryCtx_, transport);
-    VELOX_CHECK_NOT_NULL(
-        entry,
-        "No output buffer manager registered for transport '{}'",
-        transport);
-    auto manager = entry->manager;
-    {
-      std::lock_guard<std::timed_mutex> l(mutex_);
-      bufferManager_ = manager;
-      outputOperatorFactory_ = entry->makeOutputOperator;
-    }
+  if (partitionedOutputNode == nullptr) {
+    outputBufferManagerState_ = OutputBufferManagerState::kUnavailable;
+    pendingOutputBufferUpdate_.reset();
+    return;
+  }
+
+  VELOX_CHECK(hasPartitionedOutput());
+  VELOX_CHECK_GT(numOutputDrivers, 0);
+  const auto& transport = partitionedOutputNode->transportKind();
+  auto entry = OutputTransportRegistry::tryGet(*queryCtx_, transport);
+  VELOX_CHECK_NOT_NULL(
+      entry,
+      "No output buffer manager registered for transport '{}'",
+      transport);
+  auto manager = entry->manager;
+  auto outputOperatorFactory = entry->makeOutputOperator;
+
+  try {
     manager->initializeTask(
         shared_from_this(),
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
+
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      VELOX_CHECK(
+          isRunningLocked(),
+          "Task {} was terminated while initializing partitioned output: {}",
+          taskId_,
+          errorMessageLocked());
+    }
+
+    if (pendingOutputBufferUpdate_.has_value()) {
+      const auto& update = pendingOutputBufferUpdate_.value();
+      VELOX_CHECK(
+          manager->updateOutputBuffers(
+              taskId_, update.numBuffers, update.noMoreBuffers),
+          "Output buffer manager lost task {} during initialization",
+          taskId_);
+    }
+
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      VELOX_CHECK(
+          isRunningLocked(),
+          "Task {} was terminated while initializing partitioned output: {}",
+          taskId_,
+          errorMessageLocked());
+      outputOperatorFactory_ = std::move(outputOperatorFactory);
+      bufferManager_ = manager;
+      outputBufferManagerState_ = OutputBufferManagerState::kReady;
+      pendingOutputBufferUpdate_.reset();
+    }
+  } catch (...) {
+    const auto exception = std::current_exception();
+    outputBufferManagerState_ = OutputBufferManagerState::kUnavailable;
+    pendingOutputBufferUpdate_.reset();
+    outputBufferUpdateLock.unlock();
+
+    // OutputBuffer::terminate requires a terminal Task. The manager has not
+    // been published, so terminate first and then clean up any task state that
+    // initializeTask may have created before failing.
+    if (isRunning()) {
+      try {
+        setError(exception);
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to record output buffer initialization error for "
+                   << taskId_ << ": " << error.what();
+      } catch (...) {
+        LOG(ERROR) << "Failed to record output buffer initialization error for "
+                   << taskId_;
+      }
+    }
+    // Another thread can set exception_ immediately before setError() and
+    // defer its terminate() call until after setError() returns. Ensure the
+    // task is terminal before asking the manager to remove its buffer. Keep
+    // this attempt separate so a setError() failure cannot skip it.
+    if (isRunning()) {
+      try {
+        terminate(TaskState::kFailed);
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to terminate task " << taskId_
+                   << " after output buffer initialization failed: "
+                   << error.what();
+      } catch (...) {
+        LOG(ERROR) << "Failed to terminate task " << taskId_
+                   << " after output buffer initialization failed";
+      }
+    }
+    try {
+      manager->removeTask(taskId_);
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to clean up output buffer for task " << taskId_
+                 << " after initialization failed: " << error.what();
+    } catch (...) {
+      LOG(ERROR) << "Failed to clean up output buffer for task " << taskId_
+                 << " after initialization failed";
+    }
+    std::rethrow_exception(exception);
   }
 }
 
@@ -2348,8 +2429,14 @@ bool Task::isFinishedLocked() const {
 }
 
 bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
+  std::lock_guard<std::mutex> outputBufferUpdateLock(outputBufferUpdateMutex_);
+
+  std::shared_ptr<OutputBufferManager> manager;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
+    if (!isRunningLocked()) {
+      return false;
+    }
     // Ignore messages received after no-more-buffers message.
     if (noMoreOutputBuffers_) {
       return false;
@@ -2357,11 +2444,28 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     if (noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
+
+    switch (outputBufferManagerState_) {
+      case OutputBufferManagerState::kUninitialized:
+        if (pendingOutputBufferUpdate_.has_value()) {
+          pendingOutputBufferUpdate_->numBuffers =
+              std::max(pendingOutputBufferUpdate_->numBuffers, numBuffers);
+          pendingOutputBufferUpdate_->noMoreBuffers |= noMoreBuffers;
+        } else {
+          pendingOutputBufferUpdate_ =
+              PendingOutputBufferUpdate{numBuffers, noMoreBuffers};
+        }
+        return true;
+      case OutputBufferManagerState::kReady:
+        manager = bufferManager_.lock();
+        break;
+      case OutputBufferManagerState::kUnavailable:
+        return false;
+    }
   }
-  if (auto manager = outputBufferManager().lock()) {
-    return manager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
-  }
-  return false;
+
+  return manager != nullptr &&
+      manager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
 }
 
 int Task::getOutputPipelineId() const {
