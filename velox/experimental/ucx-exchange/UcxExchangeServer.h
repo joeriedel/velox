@@ -21,10 +21,14 @@
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <memory>
-#include <tuple>
+#include <mutex>
+#include <string>
+#include <vector>
 #include "velox/common/EnumDeclare.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -34,16 +38,19 @@ namespace facebook::velox::ucx_exchange {
 
 class UcxExchangeServer
     : public CommElement,
+      public UcxExchangeServerLifecycle,
       public std::enable_shared_from_this<UcxExchangeServer> {
  public:
   // Public for logging and the VELOX_DEFINE_EMBEDDED_ENUM_NAME names map.
   enum class ServerState : uint32_t {
     Created,
+    WaitingForDataEndpointAck,
     ReadyToTransfer,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
+    WaitingForFinalMetadataComplete,
     Done,
   };
 
@@ -65,9 +72,27 @@ class UcxExchangeServer
 
   void close() override;
 
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void beginCommunicatorShutdownDrain() override {
+    requestAbort();
+  }
+
+  void forceCloseForShutdown() override;
+
+  void requestAbort() override;
+
+  bool activate() override;
+
+  bool isClosed() const override {
+    return closed_.load(std::memory_order_acquire);
+  }
+
   std::string toString();
 
-  const PartitionKey& getPartitionKey() const {
+  const PartitionKey& getPartitionKey() const override {
     return partitionKey_;
   }
 
@@ -77,6 +102,12 @@ class UcxExchangeServer
   }
 
  private:
+  enum class AdmissionState : uint8_t {
+    Pending,
+    Accepted,
+    Rejected,
+  };
+
   explicit UcxExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
@@ -86,23 +117,69 @@ class UcxExchangeServer
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
 
+  /// Posts the data-endpoint ACK receive after admission and before the
+  /// accepted handshake response is sent.
+  void postDataEndpointAckReceive();
+
+  /// Posts the per-partition abort receive after admission and before the
+  /// accepted handshake response is sent.
+  void postAbortReceive();
+
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
   /// Handles data becoming available from the output queue.
   void onDataAvailable(std::shared_ptr<cudf::packed_columns> data);
 
-  /// Error handler after a metadata send fails.
-  void metadataSendFailed(ucs_status_t status, const std::string& taskId);
+  /// Handles completion of one non-terminal metadata send.
+  void metadataSendComplete(ucs_status_t status);
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status);
+
+  /// Sends the ordinary sequenced end-of-stream marker.
+  void sendFinalMetadata();
+
+  /// Handles completion of the terminal metadata send.
+  void finalMetadataComplete(ucs_status_t status);
+
+  /// Handles the data-endpoint ACK.
+  void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Handles a per-partition abort request.
+  void onAbortRequest(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Stops queue pulls, drains the committed transfer, and publishes the
+  /// ordinary sequenced end-of-stream marker.
+  void processAbort();
+
+  /// Starts one asynchronous output-queue request.
+  void requestData();
+
+  /// Installs a callback on the stable producer queue. A callback that races
+  /// server destruction releases any dequeued in-flight accounting itself.
+  void installDataCallback();
+
+  /// Completes a remote data bundle once both tag sends have completed.
+  void maybeCompleteRemoteSend();
+
+  /// Polls the current intra-process retrieval future.
+  bool pollIntraNodeRetrieve();
 
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
   void onIntraNodeRetrieveComplete();
 
+  /// Releases a dequeued packed table that was never committed to transport.
+  void releasePendingData();
+
   void releaseIntraNodeInFlightBytes();
+
+  /// Deletes this destination from the stable producer queue.
+  void deleteOutputResults();
+
+  /// Advances to Done after the terminal marker has completed.
+  void maybeFinish();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -129,6 +206,16 @@ class UcxExchangeServer
   /// close/error cleanup paths.
   std::recursive_mutex dataMutex_;
   std::atomic<bool> closed_{false};
+  std::atomic<bool> abortRequested_{false};
+  std::atomic<bool> activated_{false};
+  std::atomic<AdmissionState> admissionState_{AdmissionState::Pending};
+
+  bool dataEndpointAckReceived_{false};
+  bool normalMetadataInFlight_{false};
+  bool dataSendInFlight_{false};
+  bool finalMetadataSent_{false};
+  bool finalMetadataCompleted_{false};
+  bool outputResultsDeleted_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
   std::future<void> intraNodeRetrieveFuture_;
@@ -145,6 +232,8 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-
@@ -159,6 +248,10 @@ class UcxExchangeServer
   bool intraNodeBytesInFlight_{false};
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
+  // Early placeholder queues are initialized in place and task IDs cannot be
+  // reused after removal. Keep this exact queue alive so completion callbacks
+  // can release in-flight accounting after manager removal.
+  std::shared_ptr<UcxOutputQueue> outputQueue_;
 };
 
 } // namespace facebook::velox::ucx_exchange

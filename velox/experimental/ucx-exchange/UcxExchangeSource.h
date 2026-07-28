@@ -15,6 +15,12 @@
  */
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 #include "velox/common/EnumDeclare.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
@@ -70,6 +76,7 @@ class UcxExchangeSource
     WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData,
+    DrainingAfterAbort,
     Done,
   };
 
@@ -82,6 +89,11 @@ class UcxExchangeSource
       std::string_view taskId,
       std::string_view url,
       const std::shared_ptr<UcxExchangeQueue>& queue);
+
+  /// Starts communicator processing for this source. Call only after the
+  /// owning exchange queue has registered the source so an early connection
+  /// failure can deliver its end marker correctly.
+  void start();
 
   bool supportsMetrics() const {
     return true;
@@ -96,6 +108,12 @@ class UcxExchangeSource
   /// of an error or an operator like Limit aborting the query
   /// once it received enough data.
   void close();
+
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void forceCloseForShutdown() override;
 
   /// @brief Marks this source as registered with the exchange queue.
   /// Must be called after addSourceLocked() increments numSources_ for this
@@ -146,6 +164,9 @@ class UcxExchangeSource
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
+    // Abort draining does not depend on free device memory. A committed GPU
+    // send can land in this host buffer and be discarded without unpacking.
+    std::unique_ptr<uint8_t[]> discardBuf;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
     bool receiveBytesReserved{false};
   };
@@ -218,6 +239,33 @@ class UcxExchangeSource
   /// @param arg The HandshakeResponse data
   void onHandshakeResponse(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// Sends the initial READY acknowledgement after the first receive or
+  /// intra-process poll has been posted.
+  void sendHandshakeAck();
+
+  void onHandshakeAck(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Sends the per-partition abort control after an accepted handshake.
+  void sendAbort();
+
+  void onAbortSent(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Drains the producer's at-most-one committed payload and sequenced final
+  /// marker after close, without consumer backpressure.
+  void startAbortDrain();
+
+  void processAbortDrain();
+
+  /// Reports a local processing failure to the consumer, then uses the normal
+  /// abort protocol to drain any payload the producer may already have
+  /// committed.
+  void failAndStartAbortDrain(std::string errorMessage);
+
+  /// Reports an unrecoverable protocol/transport failure and tears down the
+  /// shared endpoint. All sibling elements are force-closed because no
+  /// wire-level drain is possible once a committed tag cannot be consumed.
+  void failAndCloseEndpoint(std::string errorMessage);
+
   /// @brief For intra-node transfer: initiates waiting for data from registry.
   void waitForIntraNodeData();
 
@@ -253,7 +301,9 @@ class UcxExchangeSource
   /// @return Returns true if state was changed, false otherwise.
   bool setStateIf(ReceiverState expected, ReceiverState desired);
 
-  bool receiveQueueExceedsHighWater();
+  /// Atomically with respect to consumer dequeue decisions, marks this source
+  /// dormant when the shared receive queue is above its prefetch limit.
+  bool pauseForBackpressureIfNeeded();
 
   // The connection parameters
   const std::string host_;
@@ -271,8 +321,15 @@ class UcxExchangeSource
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};
+  std::atomic<bool> started_{false};
+  std::atomic<bool> closeRequested_{false};
   std::atomic<bool> closed_{false};
+  bool cleanupStarted_{false};
+  bool handshakeAccepted_{false};
+  bool handshakeAckNeeded_{false};
+  bool abortSent_{false};
   bool atEnd_{false}; // set when "atEnd" is being received.
+  bool endpointCleanupRequested_{false};
 
   /// @brief Guards exactly-once delivery of the nullptr end-of-stream marker.
   /// Only one thread can win the CAS and call enqueue(nullptr).
@@ -297,15 +354,22 @@ class UcxExchangeSource
   // when the queue drains to the low-water threshold.
   std::atomic<bool> backpressureActive_{false};
   std::shared_ptr<DataAndMetadata> pendingDataReceive_;
+  std::shared_ptr<DataAndMetadata> activeDataReceive_;
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
 
-  // The outstanding request - there can only be one outstanding request
-  // at any point in time. Used for handshake, metadata and data.
-  // NOTE: The request owns/holds a reference to the upcall function
-  // and must therefore exist until the upcall is done.
-  std::shared_ptr<ucxx::Request> request_{nullptr};
+  // Keep send and receive requests classified by operation. UCP only supports
+  // exact cancellation for tag receives; active-message and tag sends must be
+  // retained until completion.
+  std::shared_ptr<ucxx::Request> handshakeRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> handshakeResponseRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> handshakeAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> metadataRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+  bool metadataReceivePosted_{false};
+  bool dataReceivePosted_{false};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

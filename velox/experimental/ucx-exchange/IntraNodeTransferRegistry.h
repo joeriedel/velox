@@ -59,6 +59,10 @@ struct IntraNodeTransferEntry {
   std::promise<void> retrievedPromise; // Server waits on this after publishing
   std::mutex entryMutex;
   bool ready{false}; // True when data is ready to retrieve
+  /// Guarded by entryMutex. poll() and cancelTask() can race after either one
+  /// removes the registry entry, but the producer promise must be fulfilled
+  /// exactly once.
+  bool retrievalSignaled{false};
 };
 
 /// @brief Singleton registry for intra-node data transfers.

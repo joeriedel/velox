@@ -1046,6 +1046,18 @@ bool UcxOutputQueue::isFinishedLocked() {
   return true;
 }
 
+std::optional<exec::TaskState> UcxOutputQueue::taskState() {
+  std::shared_ptr<exec::Task> task;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    task = task_;
+  }
+  if (task == nullptr) {
+    return std::nullopt;
+  }
+  return task->state();
+}
+
 void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   using Kind = core::PartitionedOutputNode::Kind;
   bool isFinished{false};

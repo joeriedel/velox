@@ -18,6 +18,8 @@
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
+#include <limits>
+#include <new>
 #include "velox/common/EnumDefine.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -28,6 +30,16 @@ using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+struct GpuCallbackOnce {
+  bool tryClaim() {
+    bool expected = false;
+    return claimed.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel);
+  }
+
+  std::atomic<bool> claimed{false};
+};
+
 const folly::F14FastMap<UcxExchangeSource::ReceiverState, std::string_view>&
 receiverStateNames() {
   static const folly::F14FastMap<
@@ -47,6 +59,8 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
            "WaitingForIntraNodeData"},
+          {UcxExchangeSource::ReceiverState::DrainingAfterAbort,
+           "DrainingAfterAbort"},
           {UcxExchangeSource::ReceiverState::Done, "Done"},
       };
   return kNames;
@@ -81,7 +95,7 @@ UcxExchangeSource::UcxExchangeSource(
     uint16_t port,
     const PartitionKey& partitionKey,
     const std::shared_ptr<UcxExchangeQueue> queue)
-    : CommElement(communicator),
+    : CommElement(communicator, true),
       host_(host),
       port_(port),
       taskId_(taskId),
@@ -107,101 +121,123 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
   auto key = extractTaskAndDestinationId(uri.path());
   auto source = std::shared_ptr<UcxExchangeSource>(
       new UcxExchangeSource(communicator, taskId, host, port, key, queue));
-  // register the exchange source with the communicator. This makes sure that
-  // "progress" is called.
-  communicator->registerCommElement(source);
   VLOG(3) << source->toString()
           << " creating UcxExchangeSource for url: " << url;
   return source;
 }
 
+void UcxExchangeSource::start() {
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  bool expected = false;
+  VELOX_CHECK(
+      started_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel),
+      "UcxExchangeSource::start called more than once");
+  auto self = getSelfPtr();
+  VELOX_CHECK_NOT_NULL(self, "UcxExchangeSource must be owned by shared_ptr");
+  communicator_->registerCommElement(std::move(self));
+}
+
 void UcxExchangeSource::process() {
-  drainStateEvents();
+  while (true) {
+    drainStateEvents();
+    if (closed_.load(std::memory_order_acquire)) {
+      return;
+    }
 
-  if (closed_) {
-    // Driver thread called closed
-    cleanUp();
-    return;
-  }
+    if (closeRequested_.load(std::memory_order_acquire)) {
+      if (getState() == ReceiverState::Created) {
+        setState(ReceiverState::Done);
+      } else if (
+          handshakeAccepted_ &&
+          getState() != ReceiverState::DrainingAfterAbort &&
+          getState() != ReceiverState::Done) {
+        startAbortDrain();
+      }
+    }
 
-  switch (state_) {
-    case ReceiverState::Created: {
-      // Get the endpoint.
-      HostPort hp{host_, port_};
-      std::shared_ptr<UcxExchangeSource> selfPtr = getSelfPtr();
-      auto epRef = communicator_->assocEndpointRef(selfPtr, hp);
-      if (epRef) {
-        setEndpoint(epRef);
-        setStateIf(
-            ReceiverState::Created, ReceiverState::WaitingForHandshakeComplete);
-        sendHandshake();
-      } else {
-        // connection failed.
-        VLOG(0) << toString() << " Failed to connect to " << host_ << ":"
-                << std::to_string(port_);
+    switch (state_) {
+      case ReceiverState::Created: {
+        HostPort hp{host_, port_};
+        auto self = getSelfPtr();
+        auto epRef = communicator_->assocEndpointRef(self, hp);
+        if (epRef) {
+          setEndpoint(epRef);
+          setStateIf(
+              ReceiverState::Created,
+              ReceiverState::WaitingForHandshakeComplete);
+          sendHandshake();
+          return;
+        }
+
+        auto errorMsg = fmt::format(
+            "Failed to connect GPU UCX exchange source to {}:{}, task {}",
+            host_,
+            port_,
+            partitionKey_.toString());
+        LOG(ERROR) << toString() << " " << errorMsg;
+        queue_->setError(errorMsg);
         deliverEndMarker();
         setState(ReceiverState::Done);
+        continue;
       }
-      communicator_->addToWorkQueue(getSelfPtr());
-    } break;
-    case ReceiverState::WaitingForHandshakeComplete:
-      // Waiting for handshake send completion is handled by callback.
-      break;
-    case ReceiverState::WaitingForHandshakeResponse:
-      // Waiting for HandshakeResponse is handled by callback.
-      break;
-    case ReceiverState::ReadyToReceive: {
-      // Backpressure: don't post the next receive if the consumer queue is
-      // overloaded. The source goes dormant (not in work queue) and will be
-      // woken by UcxExchangeClient::next() calling resumeFromBackpressure()
-      // when the queue drains below the low water mark.
-      //
-      // This creates natural backpressure: the server's tagSend for data
-      // will block at rendezvous until we post a matching tagRecv. For
-      // intra-node: the server's publish future won't resolve until we poll.
-      if (receiveQueueExceedsHighWater()) {
-        backpressureActive_.store(true, std::memory_order_release);
-        // Go dormant; do not re-enqueue into work queue.
-        // UcxExchangeClient::next() will call resumeFromBackpressure().
-        break;
-      }
+      case ReceiverState::WaitingForHandshakeComplete:
+      case ReceiverState::WaitingForHandshakeResponse:
+      case ReceiverState::WaitingForMetadata:
+      case ReceiverState::WaitingForData:
+        return;
+      case ReceiverState::ReadyToReceive: {
+        if (pauseForBackpressureIfNeeded()) {
+          return;
+        }
 
-      if (isIntraNodeTransfer_) {
-        // INTRA-NODE TRANSFER: Use registry instead of UCXX
-        setStateIf(
-            ReceiverState::ReadyToReceive,
-            ReceiverState::WaitingForIntraNodeData);
+        if (isIntraNodeTransfer_) {
+          setStateIf(
+              ReceiverState::ReadyToReceive,
+              ReceiverState::WaitingForIntraNodeData);
+          waitForIntraNodeData();
+        } else {
+          setStateIf(
+              ReceiverState::ReadyToReceive, ReceiverState::WaitingForMetadata);
+          getMetadata();
+        }
+
+        // READY-gate the producer: the first receive/poll is established
+        // before the ACK can let it publish sequence zero.
+        if (handshakeAckNeeded_) {
+          handshakeAckNeeded_ = false;
+          sendHandshakeAck();
+        }
+        return;
+      }
+      case ReceiverState::WaitingForReceiveCredit:
+        if (pendingDataReceive_) {
+          startDataReceive(std::move(pendingDataReceive_));
+        }
+        return;
+      case ReceiverState::WaitingForIntraNodeData:
         waitForIntraNodeData();
-      } else {
-        // REMOTE EXCHANGE: Use UCXX for metadata and data
-        setStateIf(
-            ReceiverState::ReadyToReceive, ReceiverState::WaitingForMetadata);
-        getMetadata();
-      }
-    } break;
-    case ReceiverState::WaitingForMetadata:
-      // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
-      break;
-    case ReceiverState::WaitingForReceiveCredit:
-      if (pendingDataReceive_) {
-        startDataReceive(std::move(pendingDataReceive_));
-      }
-      break;
-    case ReceiverState::WaitingForData:
-      // Waiting for data is handled by an upcall from UCXX. Nothing to do.
-      break;
-    case ReceiverState::WaitingForIntraNodeData:
-      // Poll for intra-node transfer data
-      waitForIntraNodeData();
-      break;
-    case ReceiverState::Done:
-      // We need to call clean-up in this thread to remove any state
-      cleanUp();
-      break;
+        return;
+      case ReceiverState::DrainingAfterAbort:
+        processAbortDrain();
+        if (getState() == ReceiverState::Done) {
+          continue;
+        }
+        return;
+      case ReceiverState::Done:
+        cleanUp();
+        return;
+    }
   }
 }
 
 void UcxExchangeSource::cleanUp() {
+  if (cleanupStarted_) {
+    return;
+  }
+  cleanupStarted_ = true;
+  closed_.store(true, std::memory_order_release);
+
   uint32_t value = static_cast<uint32_t>(getState());
   if (value != static_cast<uint32_t>(ReceiverState::Done)) {
     // Unexpected cleanup
@@ -209,20 +245,38 @@ void UcxExchangeSource::cleanUp() {
             << " In UcxExchangeSource::cleanUp state == " << value;
   }
 
-  // Cancel any outstanding request. With weak_ptr callbacks, the callback
-  // will safely no-op if we're destroyed before it completes.
-  if (request_ && !request_->isCompleted()) {
-    // The Task has failed and we may need to cancel outstanding requests
-    request_->cancel();
-  }
+  releaseReceiveBytes(pendingDataReceive_);
+  releaseReceiveBytes(activeDataReceive_);
+  pendingDataReceive_.reset();
+  activeDataReceive_.reset();
 
-  // Move all requests to the Communicator's deferred list so the GPU
-  // buffers they reference (via their arg shared_ptr) stay alive until
-  // UCX has fully processed any in-flight operations.
   if (communicator_) {
-    if (request_) {
-      communicator_->deferRequestCleanup(std::move(request_));
+    // UCP cancellation is defined for tag receives, not tag or active-message
+    // sends. Retain control sends and exact-cancel only receives that cannot
+    // have a useful completion after terminal cleanup.
+    if (handshakeRequest_) {
+      communicator_->deferRequestCleanup(std::move(handshakeRequest_));
     }
+    if (handshakeAckRequest_) {
+      communicator_->deferRequestCleanup(std::move(handshakeAckRequest_));
+    }
+    if (abortRequest_) {
+      communicator_->deferRequestCleanup(std::move(abortRequest_));
+    }
+
+    std::vector<std::shared_ptr<ucxx::Request>> receiveRequests;
+    receiveRequests.reserve(3);
+    if (handshakeResponseRequest_) {
+      receiveRequests.push_back(std::move(handshakeResponseRequest_));
+    }
+    if (metadataRequest_) {
+      receiveRequests.push_back(std::move(metadataRequest_));
+    }
+    if (dataRequest_) {
+      receiveRequests.push_back(std::move(dataRequest_));
+    }
+    communicator_->deferTagReceiveCancellation(std::move(receiveRequests));
+
     for (auto& req : completedRequests_) {
       communicator_->deferRequestCleanup(std::move(req));
     }
@@ -239,30 +293,37 @@ void UcxExchangeSource::cleanUp() {
 }
 
 void UcxExchangeSource::close() {
-  // This is called by the driver thread so we need to be careful to
-  // indicate to the process thread that we are closing and
-  // let it do the actual cleaning up.
-
-  // Use memory_order_acq_rel to ensure proper synchronization with callbacks
-  // that check closed_ with memory_order_acquire.
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
   bool expected = false;
-  bool desired = true;
-  if (!closed_.compare_exchange_strong(
-          expected, desired, std::memory_order_acq_rel)) {
-    return; // already closed.
+  if (!closeRequested_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
   }
 
   VLOG(1) << toString() << " UcxExchangeSource::close called.";
-
-  // Guarantee the end marker is delivered before transitioning to Done.
   deliverEndMarker();
+  if (started_.load(std::memory_order_acquire)) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+}
 
-  // Let the communicator thread do the actual clean-up.
+void UcxExchangeSource::forceCloseForShutdown() {
+  closeRequested_.store(true, std::memory_order_release);
+  deliverEndMarker();
   setState(ReceiverState::Done);
-  communicator_->addToWorkQueue(getSelfPtr());
+  cleanUp();
+  // Release receive reservations carried by callbacks that completed just
+  // before forced cleanup. Later callbacks observe closed_ and become no-ops.
+  drainStateEvents();
 }
 
 void UcxExchangeSource::resumeFromBackpressure() {
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  if (closeRequested_.load(std::memory_order_acquire) ||
+      closed_.load(std::memory_order_acquire)) {
+    backpressureActive_.store(false, std::memory_order_release);
+    return;
+  }
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(
           expected, false, std::memory_order_acq_rel)) {
@@ -375,19 +436,20 @@ void UcxExchangeSource::sendHandshake() {
       communicator_->kAmCallbackOwner, communicator_->kAmCallbackId);
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-  if (request_) {
-    completedRequests_.push_back(std::move(request_));
-  }
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
   // Pass handshakeReq as the callback arg to keep the send buffer alive until
   // the async amSend completes. UCXX stores it as shared_ptr<void> but the
   // type-erased deleter still calls ~HandshakeMsg correctly.
-  request_ = endpointRef_->endpoint_->amSend(
+  handshakeRequest_ = endpointRef_->endpoint_->amSend(
       handshakeReq.get(),
       sizeof(*handshakeReq),
       UCS_MEMORY_TYPE_HOST,
       info,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
         if (auto self = weak.lock()) {
           self->enqueueStateEvent(
               self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
@@ -425,11 +487,7 @@ void UcxExchangeSource::onHandshake(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    failAndCloseEndpoint(std::move(errorMsg));
   } else {
     VLOG(3) << toString() << "+ onHandshake " << ucs_status_string(status);
     // Now wait for the HandshakeResponse from the server
@@ -452,16 +510,21 @@ void UcxExchangeSource::getMetadata() {
 
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-  if (request_) {
-    completedRequests_.push_back(std::move(request_));
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
+  if (metadataRequest_) {
+    completedRequests_.push_back(std::move(metadataRequest_));
   }
-  request_ = endpointRef_->endpoint_->tagRecv(
+  metadataReceivePosted_ = true;
+  metadataRequest_ = endpointRef_->endpoint_->tagRecv(
       reinterpret_cast<void*>(metadataReq->data()),
       kMaxMetaBufSize,
       ucxx::Tag{metadataTag},
       ucxx::TagMaskFull,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
         if (auto self = weak.lock()) {
           self->enqueueStateEvent(
               self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
@@ -475,14 +538,16 @@ void UcxExchangeSource::getMetadata() {
 void UcxExchangeSource::onMetadata(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
-  // Check if close() was called - avoid processing if we're shutting down
+  metadataReceivePosted_ = false;
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onMetadata called after close, ignoring";
     deliverEndMarker();
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
-  if (getState() != ReceiverState::WaitingForMetadata) {
+  const auto state = getState();
+  const bool draining = state == ReceiverState::DrainingAfterAbort;
+  if (state != ReceiverState::WaitingForMetadata && !draining) {
     VLOG(2) << toString() << " onMetadata called in state "
             << toName(getState()) << ", ignoring (possible UCXX replay)";
     return;
@@ -496,13 +561,14 @@ void UcxExchangeSource::onMetadata(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    failAndCloseEndpoint(std::move(errorMsg));
   } else {
-    VELOX_CHECK_NOT_NULL(arg, "Didn't get metadata");
+    if (!arg) {
+      failAndCloseEndpoint(fmt::format(
+          "GPU exchange metadata callback returned no buffer for {}",
+          partitionKey_.toString()));
+      return;
+    }
 
     // arg contains the actual serialized metadata, deserialize the metadata
     std::shared_ptr<std::vector<uint8_t>> metadataMsg =
@@ -510,11 +576,23 @@ void UcxExchangeSource::onMetadata(
 
     auto ptr = std::make_shared<DataAndMetadata>();
 
-    ptr->metadata =
-        std::move(MetadataMsg::deserializeMetadataMsg(metadataMsg->data()));
-
-    VELOX_CHECK_GE(
-        ptr->metadata.dataSizeBytes, 0, "UCX metadata data size is negative");
+    try {
+      ptr->metadata =
+          std::move(MetadataMsg::deserializeMetadataMsg(metadataMsg->data()));
+      VELOX_CHECK_GE(
+          ptr->metadata.dataSizeBytes, 0, "UCX metadata data size is negative");
+    } catch (const std::exception& e) {
+      failAndCloseEndpoint(fmt::format(
+          "Failed to decode GPU exchange metadata for {}: {}",
+          partitionKey_.toString(),
+          e.what()));
+      return;
+    } catch (...) {
+      failAndCloseEndpoint(fmt::format(
+          "Failed to decode GPU exchange metadata for {}",
+          partitionKey_.toString()));
+      return;
+    }
 
     VLOG(3) << toString()
             << " Datasize bytes == " << ptr->metadata.dataSizeBytes;
@@ -525,7 +603,7 @@ void UcxExchangeSource::onMetadata(
       // enqueue a nullpointer to mark the end for this source.
       VLOG(3) << "There is no more data to transfer for " << toString();
       deliverEndMarker();
-      setStateIf(ReceiverState::WaitingForMetadata, ReceiverState::Done);
+      setState(ReceiverState::Done);
       communicator_->addToWorkQueue(getSelfPtr());
       // jump out of this function.
       return;
@@ -585,65 +663,110 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
   }
 
   const auto expectedState = getState();
+  const bool draining = expectedState == ReceiverState::DrainingAfterAbort;
   VELOX_CHECK(
       expectedState == ReceiverState::WaitingForMetadata ||
-          expectedState == ReceiverState::WaitingForReceiveCredit,
+          expectedState == ReceiverState::WaitingForReceiveCredit || draining,
       "Unexpected state {} before starting UCX data receive",
       toName(expectedState));
 
-  if (!tryReserveReceiveBytes(ptr)) {
+  // Once abort has been sent, consumer flow control must not prevent us from
+  // landing and discarding a payload the producer already committed.
+  if (!draining && !tryReserveReceiveBytes(ptr)) {
     return;
   }
 
-  // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-  ptr->stream = stream;
-  try {
-    ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-        ptr->metadata.dataSizeBytes,
-        stream,
-        cudf::get_current_device_resource_ref());
-  } catch (const rmm::bad_alloc& e) {
-    releaseReceiveBytes(ptr);
-    VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
-    bool retryLater = false;
-    {
-      std::lock_guard<std::mutex> l(queue_->mutex());
-      retryLater = queue_->recordReceiveAllocationPressureLocked(
-          static_cast<uint64_t>(ptr->metadata.dataSizeBytes));
+  void* receiveBuffer{nullptr};
+  if (draining) {
+    // A query can be canceled because device memory is exhausted. Land the
+    // already-committed GPU payload in ordinary host memory so cancellation
+    // never depends on another RMM allocation, then discard it in onData().
+    const auto discardSize = static_cast<uint64_t>(ptr->metadata.dataSizeBytes);
+    if (discardSize > std::numeric_limits<size_t>::max()) {
+      failAndCloseEndpoint(fmt::format(
+          "GPU exchange drain payload {} is too large for host address space "
+          "for {}",
+          discardSize,
+          partitionKey_.toString()));
+      return;
     }
-    if (retryLater) {
-      pendingDataReceive_ = std::move(ptr);
-      backpressureActive_.store(true, std::memory_order_release);
-      if (expectedState == ReceiverState::WaitingForMetadata) {
-        setStateIf(
-            ReceiverState::WaitingForMetadata,
-            ReceiverState::WaitingForReceiveCredit);
+    try {
+      // Default-initialized scalar array storage avoids zero-filling a payload
+      // that is immediately overwritten by UCX and discarded.
+      ptr->discardBuf = std::unique_ptr<uint8_t[]>(
+          new uint8_t[static_cast<size_t>(discardSize)]);
+    } catch (const std::exception& e) {
+      auto errorMsg = fmt::format(
+          "Failed to allocate {} host bytes while draining GPU exchange {}: {}",
+          discardSize,
+          partitionKey_.toString(),
+          e.what());
+      failAndCloseEndpoint(std::move(errorMsg));
+      return;
+    }
+    receiveBuffer = ptr->discardBuf.get();
+  } else {
+    // Normal remote exchange receives directly into device memory.
+    auto stream =
+        facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+    ptr->stream = stream;
+    try {
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes,
+          stream,
+          cudf::get_current_device_resource_ref());
+    } catch (const rmm::bad_alloc& e) {
+      releaseReceiveBytes(ptr);
+      VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
+      bool retryLater = false;
+      {
+        std::lock_guard<std::mutex> l(queue_->mutex());
+        retryLater = queue_->recordReceiveAllocationPressureLocked(
+            static_cast<uint64_t>(ptr->metadata.dataSizeBytes));
+        if (retryLater) {
+          // Publish the dormant state while holding the same mutex consumers
+          // use to decide whether to wake sources. This prevents a dequeue
+          // from observing the old value and losing the only wake-up.
+          backpressureActive_.store(true, std::memory_order_release);
+        }
       }
+      if (retryLater) {
+        pendingDataReceive_ = std::move(ptr);
+        if (expectedState == ReceiverState::WaitingForMetadata) {
+          setStateIf(
+              ReceiverState::WaitingForMetadata,
+              ReceiverState::WaitingForReceiveCredit);
+        }
+        return;
+      }
+
+      // The producer committed this data tag when it sent the metadata. Keep
+      // the metadata, enter the abort protocol, and land the payload in the
+      // host discard buffer. Going directly to Done would leave the producer's
+      // GPU send unmatched—the exact stale state that cancellation must clear.
+      pendingDataReceive_ = std::move(ptr);
+      failAndStartAbortDrain(fmt::format(
+          "Failed to allocate {} GPU bytes for exchange {}",
+          pendingDataReceive_->metadata.dataSizeBytes,
+          partitionKey_.toString()));
       return;
     }
 
-    queue_->setError("Failed to alloc GPU memory");
-    deliverEndMarker();
-    setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
-    return;
+    // UCX receives into this raw pointer on a UCX-owned CUDA stream. The
+    // allocation comes from an async RMM pool on `stream`, so make the
+    // allocation complete before handing the pointer to UCX.
+    stream.synchronize();
+    receiveBuffer = ptr->dataBuf->data();
   }
 
-  // UCX receives into this raw pointer on a UCX-owned CUDA stream. The
-  // allocation comes from an async RMM pool on `stream`, so make the allocation
-  // complete on the host before handing the pointer to UCX.
-  stream.synchronize();
-
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
-          << " bytes of device memory";
+          << (draining ? " host drain bytes" : " bytes of device memory");
 
   uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
   VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
           << " using tag: " << std::hex << dataTag << std::dec;
 
-  if (!setStateIf(expectedState, ReceiverState::WaitingForData)) {
+  if (!draining && !setStateIf(expectedState, ReceiverState::WaitingForData)) {
     releaseReceiveBytes(ptr);
     VLOG(1) << toString() << " startDataReceive invalid previous state "
             << toName(getState());
@@ -651,16 +774,22 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
   }
 
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-  if (request_) {
-    completedRequests_.push_back(std::move(request_));
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
+  if (dataRequest_) {
+    completedRequests_.push_back(std::move(dataRequest_));
   }
-  request_ = endpointRef_->endpoint_->tagRecv(
-      ptr->dataBuf->data(),
+  activeDataReceive_ = ptr;
+  dataReceivePosted_ = true;
+  dataRequest_ = endpointRef_->endpoint_->tagRecv(
+      receiveBuffer,
       ptr->metadata.dataSizeBytes,
       ucxx::Tag{dataTag},
       ucxx::TagMaskFull,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
         if (auto self = weak.lock()) {
           self->enqueueStateEvent(
               self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
@@ -672,7 +801,7 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
 }
 
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
-  // Check if close() was called - avoid processing if we're shutting down
+  dataReceivePosted_ = false;
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onData called after close, ignoring";
     releaseReceiveBytes(std::static_pointer_cast<DataAndMetadata>(arg));
@@ -680,7 +809,9 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
-  if (getState() != ReceiverState::WaitingForData) {
+  const auto state = getState();
+  const bool draining = state == ReceiverState::DrainingAfterAbort;
+  if (state != ReceiverState::WaitingForData && !draining) {
     VLOG(2) << toString() << " onData called in state " << toName(getState())
             << ", ignoring (possible UCXX replay)";
     releaseReceiveBytes(std::static_pointer_cast<DataAndMetadata>(arg));
@@ -691,17 +822,23 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   if (status != UCS_OK) {
     auto ptr = std::static_pointer_cast<DataAndMetadata>(arg);
     releaseReceiveBytes(ptr);
+    activeDataReceive_.reset();
     std::string errorMsg = fmt::format(
         "Failed to receive data from host {}:{}, task {}: {}",
         host_,
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << toString() << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
+    failAndCloseEndpoint(std::move(errorMsg));
   } else {
+    if (!arg) {
+      releaseReceiveBytes(activeDataReceive_);
+      activeDataReceive_.reset();
+      failAndCloseEndpoint(fmt::format(
+          "GPU exchange data callback returned no buffer for {}",
+          partitionKey_.toString()));
+      return;
+    }
     VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
             << " got chunk: " << sequenceNumber_;
 
@@ -709,28 +846,55 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     std::shared_ptr<DataAndMetadata> ptr =
         std::static_pointer_cast<DataAndMetadata>(arg);
+
+    if (draining) {
+      releaseReceiveBytes(ptr);
+      activeDataReceive_.reset();
+      communicator_->addToWorkQueue(getSelfPtr());
+      return;
+    }
+
     const uint64_t reservedReceiveBytes = ptr->receiveBytesReserved
         ? static_cast<uint64_t>(ptr->metadata.dataSizeBytes)
         : 0;
-    ptr->receiveBytesReserved = false;
 
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
-    // Create packed_columns from the received metadata and data buffer
-    cudf::packed_columns packedCols(
-        std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+    PackedTableWithStreamPtr data;
+    try {
+      // Create packed_columns from the received metadata and data buffer.
+      cudf::packed_columns packedCols(
+          std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
 
-    // Unpack to get the table_view and create a packed_table
-    cudf::table_view tableView = cudf::unpack(packedCols);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedCols)});
+      // Unpack to get the table_view and create a packed_table.
+      cudf::table_view tableView = cudf::unpack(packedCols);
+      auto packedTable = std::make_unique<cudf::packed_table>(
+          cudf::packed_table{tableView, std::move(packedCols)});
 
-    // Bundle the packed_table with the stream that was used for allocation
-    auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream);
+      // Bundle the packed_table with the stream used for allocation.
+      data = std::make_unique<PackedTableWithStream>(
+          std::move(packedTable), ptr->stream);
+    } catch (const std::exception& e) {
+      releaseReceiveBytes(ptr);
+      activeDataReceive_.reset();
+      failAndStartAbortDrain(fmt::format(
+          "Failed to unpack GPU exchange payload for {}: {}",
+          partitionKey_.toString(),
+          e.what()));
+      return;
+    } catch (...) {
+      releaseReceiveBytes(ptr);
+      activeDataReceive_.reset();
+      failAndStartAbortDrain(fmt::format(
+          "Failed to unpack GPU exchange payload for {}",
+          partitionKey_.toString()));
+      return;
+    }
 
+    ptr->receiveBytesReserved = false;
     enqueue(std::move(data), reservedReceiveBytes);
+    activeDataReceive_.reset();
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
   communicator_->addToWorkQueue(getSelfPtr());
@@ -746,16 +910,17 @@ void UcxExchangeSource::receiveHandshakeResponse() {
 
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-  if (request_) {
-    completedRequests_.push_back(std::move(request_));
-  }
-  request_ = endpointRef_->endpoint_->tagRecv(
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
+  handshakeResponseRequest_ = endpointRef_->endpoint_->tagRecv(
       responseBuffer.get(),
       sizeof(*responseBuffer),
       ucxx::Tag{responseTag},
       ucxx::TagMaskFull,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
         if (auto self = weak.lock()) {
           self->enqueueStateEvent(
               self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
@@ -790,7 +955,28 @@ void UcxExchangeSource::onHandshakeResponse(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
+    failAndCloseEndpoint(std::move(errorMsg));
+    return;
+  }
+
+  std::shared_ptr<HandshakeResponse> response =
+      std::static_pointer_cast<HandshakeResponse>(arg);
+  if (!response) {
+    failAndCloseEndpoint(fmt::format(
+        "GPU exchange handshake response returned no buffer for {}",
+        partitionKey_.toString()));
+    return;
+  }
+
+  if (response->status != GpuHandshakeResponseStatus::kAccepted) {
+    std::string errorMsg = fmt::format(
+        "GPU exchange producer rejected the handshake from host {}:{}, task "
+        "{} (status={})",
+        host_,
+        port_,
+        partitionKey_.toString(),
+        static_cast<int>(response->status));
+    LOG(ERROR) << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
@@ -798,17 +984,173 @@ void UcxExchangeSource::onHandshakeResponse(
     return;
   }
 
-  std::shared_ptr<HandshakeResponse> response =
-      std::static_pointer_cast<HandshakeResponse>(arg);
-
   isIntraNodeTransfer_ = response->isIntraNodeTransfer;
+  handshakeAccepted_ = true;
+  handshakeAckNeeded_ = true;
 
   VLOG(3) << toString() << " + onHandshakeResponse isIntraNodeTransfer="
           << isIntraNodeTransfer_;
 
-  setStateIf(
-      ReceiverState::WaitingForHandshakeResponse,
-      ReceiverState::ReadyToReceive);
+  if (closeRequested_.load(std::memory_order_acquire)) {
+    startAbortDrain();
+  } else {
+    setStateIf(
+        ReceiverState::WaitingForHandshakeResponse,
+        ReceiverState::ReadyToReceive);
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeSource::sendHandshakeAck() {
+  auto ack = std::make_shared<GpuHandshakeAckHeader>();
+  const uint64_t ackTag = getGpuHandshakeAckTag(partitionKeyHash_);
+
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
+  handshakeAckRequest_ = endpointRef_->endpoint_->tagSend(
+      ack.get(),
+      sizeof(*ack),
+      ucxx::Tag{ackTag},
+      false,
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onHandshakeAck(status, std::move(arg));
+              });
+        }
+      },
+      ack);
+}
+
+void UcxExchangeSource::onHandshakeAck(
+    ucs_status_t status,
+    std::shared_ptr<void> /*arg*/) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_OK) {
+    return;
+  }
+
+  auto errorMsg = fmt::format(
+      "Failed to send GPU handshake ACK to host {}:{}, task {}: {}",
+      host_,
+      port_,
+      partitionKey_.toString(),
+      ucs_status_string(status));
+  failAndCloseEndpoint(std::move(errorMsg));
+}
+
+void UcxExchangeSource::sendAbort() {
+  if (abortSent_ || !handshakeAccepted_) {
+    return;
+  }
+  abortSent_ = true;
+
+  auto abort = std::make_shared<GpuAbortHeader>();
+  const uint64_t abortTag = getGpuAbortTag(partitionKeyHash_);
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<GpuCallbackOnce>();
+  abortRequest_ = endpointRef_->endpoint_->tagSend(
+      abort.get(),
+      sizeof(*abort),
+      ucxx::Tag{abortTag},
+      false,
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onAbortSent(status, std::move(arg));
+              });
+        }
+      },
+      abort);
+}
+
+void UcxExchangeSource::onAbortSent(
+    ucs_status_t status,
+    std::shared_ptr<void> /*arg*/) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_OK) {
+    return;
+  }
+
+  auto errorMsg = fmt::format(
+      "Failed to send GPU abort control to host {}:{}, task {}: {}",
+      host_,
+      port_,
+      partitionKey_.toString(),
+      ucs_status_string(status));
+  failAndCloseEndpoint(std::move(errorMsg));
+}
+
+void UcxExchangeSource::startAbortDrain() {
+  if (!handshakeAccepted_ || getState() == ReceiverState::Done) {
+    return;
+  }
+  if (atEnd_) {
+    setState(ReceiverState::Done);
+    return;
+  }
+
+  setState(ReceiverState::DrainingAfterAbort);
+  backpressureActive_.store(false, std::memory_order_release);
+  processAbortDrain();
+}
+
+void UcxExchangeSource::processAbortDrain() {
+  if (atEnd_) {
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    return;
+  }
+
+  if (isIntraNodeTransfer_) {
+    waitForIntraNodeData();
+  } else if (pendingDataReceive_) {
+    auto pending = std::move(pendingDataReceive_);
+    startDataReceive(std::move(pending));
+  } else if (!metadataReceivePosted_ && !dataReceivePosted_) {
+    getMetadata();
+  }
+
+  // The first receive/poll above precedes the READY ACK. The abort follows the
+  // ACK so the producer can stop before pulling another queue entry.
+  if (handshakeAckNeeded_) {
+    handshakeAckNeeded_ = false;
+    sendHandshakeAck();
+  }
+  sendAbort();
+}
+
+void UcxExchangeSource::failAndStartAbortDrain(std::string errorMessage) {
+  LOG(ERROR) << toString() << " " << errorMessage;
+  queue_->setError(errorMessage);
+  deliverEndMarker();
+  closeRequested_.store(true, std::memory_order_release);
+
+  if (handshakeAccepted_ && getState() != ReceiverState::Done) {
+    startAbortDrain();
+  } else {
+    setState(ReceiverState::Done);
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeSource::failAndCloseEndpoint(std::string errorMessage) {
+  LOG(ERROR) << toString() << " " << errorMessage;
+  queue_->setError(errorMessage);
+  deliverEndMarker();
+  closeRequested_.store(true, std::memory_order_release);
+  setState(ReceiverState::Done);
+
+  if (!endpointCleanupRequested_ && endpointRef_) {
+    endpointCleanupRequested_ = true;
+    communicator_->deferEndpointCleanup(endpointRef_);
+  }
   communicator_->addToWorkQueue(getSelfPtr());
 }
 
@@ -844,7 +1186,6 @@ void UcxExchangeSource::waitForIntraNodeData() {
 void UcxExchangeSource::onIntraNodeData(
     std::shared_ptr<cudf::packed_columns> data,
     bool atEnd) {
-  // Check if close() was called
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onIntraNodeData called after close, ignoring";
     deliverEndMarker();
@@ -869,11 +1210,21 @@ void UcxExchangeSource::onIntraNodeData(
         partitionKey_.taskId,
         partitionKey_.destination,
         sequenceNumber_);
-    VLOG(0) << toString() << " " << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
+    ++sequenceNumber_;
+    failAndStartAbortDrain(std::move(errorMsg));
+    return;
+  }
+
+  const bool draining = getState() == ReceiverState::DrainingAfterAbort;
+  if (draining) {
+    ++sequenceNumber_;
     communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+
+  if (getState() != ReceiverState::WaitingForIntraNodeData) {
+    VLOG(2) << toString() << " onIntraNodeData called in state "
+            << toName(getState()) << ", ignoring";
     return;
   }
 
@@ -884,24 +1235,35 @@ void UcxExchangeSource::onIntraNodeData(
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(data->gpu_data->size());
 
-  // Convert packed_columns to PackedTableWithStream for the queue.
-  // Create packed_columns from the shared data.
-  cudf::packed_columns packedCols(
-      std::move(data->metadata), std::move(data->gpu_data));
+  PackedTableWithStreamPtr tableWithStream;
+  try {
+    // Convert packed_columns to PackedTableWithStream for the queue.
+    cudf::packed_columns packedCols(
+        std::move(data->metadata), std::move(data->gpu_data));
 
-  // Unpack to get the table_view and create a packed_table
-  cudf::table_view tableView = cudf::unpack(packedCols);
-  auto packedTable = std::make_unique<cudf::packed_table>(
-      cudf::packed_table{tableView, std::move(packedCols)});
+    cudf::table_view tableView = cudf::unpack(packedCols);
+    auto packedTable = std::make_unique<cudf::packed_table>(
+        cudf::packed_table{tableView, std::move(packedCols)});
 
-  // Get a stream from the pool so downstream cuDF operations on this data
-  // run on a dedicated stream, not the default stream. The producer already
-  // synchronized before enqueuing, so the GPU data is ready. This matches
-  // the inter-node (UCX) receive path which also allocates a pool stream.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto tableWithStream =
-      std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+    // The producer synchronized before publishing, so the GPU data is ready.
+    auto stream =
+        facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+    tableWithStream =
+        std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+  } catch (const std::exception& e) {
+    ++sequenceNumber_;
+    failAndStartAbortDrain(fmt::format(
+        "Failed to unpack intra-node GPU exchange payload for {}: {}",
+        partitionKey_.toString(),
+        e.what()));
+    return;
+  } catch (...) {
+    ++sequenceNumber_;
+    failAndStartAbortDrain(fmt::format(
+        "Failed to unpack intra-node GPU exchange payload for {}",
+        partitionKey_.toString()));
+    return;
+  }
 
   enqueue(std::move(tableWithStream));
 
@@ -932,10 +1294,17 @@ bool UcxExchangeSource::setStateIf(
   return true;
 }
 
-bool UcxExchangeSource::receiveQueueExceedsHighWater() {
+bool UcxExchangeSource::pauseForBackpressureIfNeeded() {
   std::lock_guard<std::mutex> l(queue_->mutex());
-  return !queue_->receiveBytesBelowPrefetchLimitLocked() ||
+  const bool shouldPause = !queue_->receiveBytesBelowPrefetchLimitLocked() ||
       queue_->size() >= backpressureHighWaterMark();
+  if (shouldPause) {
+    // Consumers inspect the same queue state under this mutex before calling
+    // resumeFromBackpressure(). Publish the sleep decision before releasing
+    // it so they cannot drain the queue and miss the transition.
+    backpressureActive_.store(true, std::memory_order_release);
+  }
+  return shouldPause;
 }
 
 } // namespace facebook::velox::ucx_exchange

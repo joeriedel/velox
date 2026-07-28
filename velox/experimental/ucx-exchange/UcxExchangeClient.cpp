@@ -21,7 +21,7 @@
 namespace facebook::velox::ucx_exchange {
 
 void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
-  std::shared_ptr<UcxExchangeSource> toClose;
+  std::shared_ptr<UcxExchangeSource> sourceToStart;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
 
@@ -32,24 +32,21 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
       return;
     }
 
-    std::shared_ptr<UcxExchangeSource> source;
-    source = UcxExchangeSource::create(taskId_, remoteTaskId, queue_);
-
     if (closed_) {
-      toClose = std::move(source);
-    } else {
-      sources_.push_back(source);
-      queue_->addSourceLocked();
-      source->setRegistered();
-      VLOG(3) << "@" << taskId_
-              << " Added remote split for task: " << remoteTaskId;
+      return;
     }
+
+    sourceToStart = UcxExchangeSource::create(taskId_, remoteTaskId, queue_);
+    sources_.push_back(sourceToStart);
+    queue_->addSourceLocked();
+    sourceToStart->setRegistered();
+    VLOG(3) << "@" << taskId_
+            << " Added remote split for task: " << remoteTaskId;
   }
 
-  // Outside of lock.
-  if (toClose) {
-    toClose->close();
-  }
+  // Registration can synchronously reject during communicator shutdown, so
+  // start only after releasing the exchange queue mutex.
+  sourceToStart->start();
 }
 
 void UcxExchangeClient::noMoreRemoteTasks() {
@@ -112,16 +109,14 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       if (!inFlowControl_) {
         inFlowControl_ = true;
         VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
-                << " entering flow control"
-                << " queueSize=" << queue_->size()
+                << " entering flow control" << " queueSize=" << queue_->size()
                 << " maxQueued=" << maxQueuedColumns_;
       }
       return data;
     } else if (inFlowControl_ && data != nullptr) {
       inFlowControl_ = false;
       VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
-              << " leaving flow control"
-              << " queueSize=" << queue_->size()
+              << " leaving flow control" << " queueSize=" << queue_->size()
               << " maxQueued=" << maxQueuedColumns_;
     }
 

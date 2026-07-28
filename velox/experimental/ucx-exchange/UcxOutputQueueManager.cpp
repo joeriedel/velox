@@ -39,10 +39,17 @@ void UcxOutputQueueManager::initializeTask(
     int numDestinations,
     int numDrivers) {
   const auto& taskId = task->taskId();
-  queues_.withLock([&](auto& queues) {
-    auto it = queues.find(taskId);
-    if (it == queues.end()) {
-      queues[taskId] = std::make_shared<UcxOutputQueue>(
+  state_.withLock([&](auto& state) {
+    // UCX tags do not carry a task generation. Even after requests are
+    // canceled, an old unmatched message can remain in the worker's
+    // unexpected-message queue. Presto task IDs are unique, so reject reuse.
+    VELOX_CHECK(
+        state.removedTasks.count(taskId) == 0,
+        "Cannot reuse removed GPU exchange task ID {}",
+        taskId);
+    auto it = state.queues.find(taskId);
+    if (it == state.queues.end()) {
+      state.queues[taskId] = std::make_shared<UcxOutputQueue>(
           std::move(task), numDestinations, numDrivers, kind);
     } else {
       if (!it->second->initialize(task, numDestinations, numDrivers, kind)) {
@@ -52,12 +59,6 @@ void UcxOutputQueueManager::initializeTask(
       }
     }
   });
-  // Clear any stale "removed" state so that getData() calls after this
-  // initializeTask() create proper placeholder queues if needed.
-  removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
-  // Clear any stale "cancelled" state in the intra-node registry so
-  // that the cancelledTasks_ set doesn't grow unboundedly across queries.
-  IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
 }
 
 bool UcxOutputQueueManager::updateOutputBuffers(
@@ -253,29 +254,28 @@ void UcxOutputQueueManager::deleteResults(
   }
 }
 
-void UcxOutputQueueManager::getData(
+std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getData(
     std::string_view taskId,
     int destination,
     UcxDataAvailableCallback notify) {
   std::shared_ptr<UcxOutputQueue> outputQueue;
   bool taskRemoved = false;
   std::string taskIdStr{taskId};
-  queues_.withLock([&](auto& queues) {
-    auto it = queues.find(taskIdStr);
-    if (it == queues.end()) {
+  state_.withLock([&](auto& state) {
+    auto it = state.queues.find(taskIdStr);
+    if (it == state.queues.end()) {
       // Check if the task was already removed. If so, don't re-create a
       // placeholder - the task is dead and any server calling getData() is a
       // stale leftover. Re-creating would produce an undersized queue that
       // crashes when deleteResults() is called for other destinations.
-      if (removedTasks_.withLock(
-              [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
+      if (state.removedTasks.count(taskIdStr) > 0) {
         taskRemoved = true;
         return;
       }
       // create the queue structures such that the notify callback can be
       // stored. It will be later initialized once the task is being created.
       outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
-      queues[taskIdStr] = outputQueue;
+      state.queues[taskIdStr] = outputQueue;
     } else {
       // queue exists.
       outputQueue = it->second;
@@ -284,11 +284,12 @@ void UcxOutputQueueManager::getData(
   if (taskRemoved) {
     // Fire callback immediately with nullptr to signal end-of-stream.
     notify(nullptr, {});
-    return;
+    return nullptr;
   }
   // outside of lock. Queue must exist.
   // get the data or install the notify callback.
   outputQueue->getData(destination, std::move(notify));
+  return outputQueue;
 }
 
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
@@ -297,69 +298,167 @@ bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
       queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
 }
 
-void UcxOutputQueueManager::removeTask(const std::string& taskId) {
-  const auto& taskIdStr = taskId;
-  auto queue =
-      queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
-        auto it = queues.find(taskIdStr);
-        if (it == queues.end()) {
-          // Already removed. Clear any stale "removed" state so the task ID
-          // can be reused.
-          removedTasks_.withLock(
-              [&](auto& removed) { removed.erase(taskIdStr); });
-          return nullptr;
-        }
-        auto taskQueue = it->second;
-        queues.erase(it);
-        // Insert into removedTasks_ while still holding the queues_ lock
-        // to prevent getData() from seeing a gap between erase and insert,
-        // which would cause it to create a zombie placeholder queue.
-        removedTasks_.withLock(
-            [&](auto& removed) { removed.insert(taskIdStr); });
-        return taskQueue;
-      });
-  if (queue != nullptr) {
-    queue->terminate();
+UcxOutputQueueManager::ExchangeServerAdmission
+UcxOutputQueueManager::registerExchangeServer(
+    const std::shared_ptr<UcxExchangeServerLifecycle>& server) {
+  VELOX_CHECK_NOT_NULL(server);
+  const auto key = server->getPartitionKey();
+  const auto admission = state_.withLock([&](auto& state) {
+    if (state.removedTasks.count(key.taskId) > 0) {
+      return ExchangeServerAdmission::kTaskRemoved;
+    }
+    if (state.activeServers.count(key) > 0) {
+      return ExchangeServerAdmission::kDuplicateServer;
+    }
+
+    state.activeServers.emplace(key, server);
+    if (server->isClosed()) {
+      // close() can win before registration. Keep the exact-key claim until
+      // task removal so a replacement cannot restart the old stream.
+      return ExchangeServerAdmission::kServerUnavailable;
+    }
+    return ExchangeServerAdmission::kAccepted;
+  });
+
+  if (admission == ExchangeServerAdmission::kAccepted && server->activate()) {
+    return admission;
   }
-  // Notify the intra-node registry so that any sources polling for this
-  // task get an atEnd result instead of spinning forever.
+  if (!server->isClosed()) {
+    server->requestAbort();
+  }
+  return admission == ExchangeServerAdmission::kAccepted
+      ? ExchangeServerAdmission::kServerUnavailable
+      : admission;
+}
+
+void UcxOutputQueueManager::unregisterExchangeServer(
+    const std::shared_ptr<UcxExchangeServerLifecycle>& server) {
+  if (server == nullptr) {
+    return;
+  }
+  const auto key = server->getPartitionKey();
+  state_.withLock([&](auto& state) {
+    auto active = state.activeServers.find(key);
+    if (active == state.activeServers.end()) {
+      return;
+    }
+    auto registered = active->second.lock();
+    if (registered != nullptr && registered.get() == server.get()) {
+      if (state.removedTasks.count(key.taskId) > 0) {
+        state.activeServers.erase(active);
+      } else {
+        active->second.reset();
+      }
+    }
+  });
+}
+
+void UcxOutputQueueManager::removeTask(const std::string& taskId) {
+  std::vector<std::shared_ptr<UcxExchangeServerLifecycle>> serversToAbort;
+  auto removeTaskServers = [&](auto& state, bool abortServers) {
+    for (auto active = state.activeServers.begin();
+         active != state.activeServers.end();) {
+      if (active->first.taskId != taskId) {
+        ++active;
+        continue;
+      }
+      if (abortServers) {
+        if (auto server = active->second.lock()) {
+          serversToAbort.push_back(std::move(server));
+        }
+      }
+      active = state.activeServers.erase(active);
+    }
+  };
+
+  // If no queue exists, establish the abnormal-removal tombstone now. This
+  // linearizes remove-before-initialize against initializeTask().
+  auto queue = state_.withLock([&](auto& state) {
+    auto queueIt = state.queues.find(taskId);
+    if (queueIt != state.queues.end()) {
+      return queueIt->second;
+    }
+    auto removedIt =
+        state.removedTasks.emplace(taskId, TaskRemovalKind::kAborted).first;
+    removeTaskServers(state, removedIt->second == TaskRemovalKind::kAborted);
+    return std::shared_ptr<UcxOutputQueue>{};
+  });
+
+  if (queue == nullptr) {
+    for (const auto& server : serversToAbort) {
+      server->requestAbort();
+    }
+    IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);
+    return;
+  }
+
+  // Do not hold the manager mutex while reading Task state. Task termination
+  // can call removeTask() while holding Task-internal lifecycle locks.
+  const auto proposedRemovalKind =
+      queue->taskState() == exec::TaskState::kFinished
+      ? TaskRemovalKind::kFinished
+      : TaskRemovalKind::kAborted;
+
+  auto queueToTerminate = state_.withLock([&](auto& state) {
+    auto queueIt = state.queues.find(taskId);
+    if (queueIt == state.queues.end() || queueIt->second.get() != queue.get()) {
+      return std::shared_ptr<UcxOutputQueue>{};
+    }
+    auto removedQueue = std::move(queueIt->second);
+    state.queues.erase(queueIt);
+
+    // Preserve the first removal classification. A repeated removal must not
+    // clear the tombstone or change whether live servers are aborted.
+    auto removedIt =
+        state.removedTasks.emplace(taskId, proposedRemovalKind).first;
+    removeTaskServers(state, removedIt->second == TaskRemovalKind::kAborted);
+    return removedQueue;
+  });
+
+  // Mark every server before terminate() wakes pending getData callbacks.
+  for (const auto& server : serversToAbort) {
+    server->requestAbort();
+  }
+  if (queueToTerminate != nullptr) {
+    queueToTerminate->terminate();
+  }
   IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);
 }
 
 std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueueIfExists(
     std::string_view taskId) {
   std::string taskIdStr{taskId};
-  return queues_.withLock([&](auto& queues) {
-    auto it = queues.find(taskIdStr);
-    return it == queues.end() ? nullptr : it->second;
+  return state_.withLock([&](auto& state) {
+    auto it = state.queues.find(taskIdStr);
+    return it == state.queues.end() ? nullptr : it->second;
   });
 }
 
 std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueueIfActive(
     std::string_view taskId) {
-  if (auto queue = getQueueIfExists(taskId)) {
-    return queue;
-  }
-  VELOX_CHECK(
-      isRemovedTask(taskId),
-      "Output cudf queue for task not found: {}",
-      taskId);
-  return nullptr;
-}
-
-bool UcxOutputQueueManager::isRemovedTask(std::string_view taskId) {
   std::string taskIdStr{taskId};
-  return removedTasks_.withLock(
-      [&](auto& removed) { return removed.count(taskIdStr) > 0; });
+  return state_.withLock([&](auto& state) {
+    auto it = state.queues.find(taskIdStr);
+    if (it != state.queues.end()) {
+      return it->second;
+    }
+    VELOX_CHECK(
+        state.removedTasks.count(taskIdStr) > 0,
+        "Output cudf queue for task not found: {}",
+        taskId);
+    return std::shared_ptr<UcxOutputQueue>{};
+  });
 }
 
 std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueue(
     std::string_view taskId) {
   std::string taskIdStr{taskId};
-  return queues_.withLock([&](auto& queues) {
-    auto it = queues.find(taskIdStr);
+  return state_.withLock([&](auto& state) {
+    auto it = state.queues.find(taskIdStr);
     VELOX_CHECK(
-        it != queues.end(), "Output cudf queue for task not found: {}", taskId);
+        it != state.queues.end(),
+        "Output cudf queue for task not found: {}",
+        taskId);
     return it->second;
   });
 }

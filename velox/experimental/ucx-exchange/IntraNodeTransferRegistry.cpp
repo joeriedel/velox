@@ -130,8 +130,12 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
     result.data = std::move(entry->data);
     result.atEnd = entry->atEnd;
 
-    // Fulfill the promise to notify the server while still holding entry lock
-    entry->retrievedPromise.set_value();
+    // cancelTask() can remove this entry after poll() obtains its shared_ptr.
+    // Serialize promise fulfillment with that path.
+    if (!entry->retrievalSignaled) {
+      entry->retrievalSignaled = true;
+      entry->retrievedPromise.set_value();
+    }
   }
 
   // Remove entry from registry (after releasing entry lock but before
@@ -174,10 +178,9 @@ void IntraNodeTransferRegistry::cancelTask(std::string_view taskId) {
       entry->ready = true;
       entry->atEnd = true;
     }
-    try {
+    if (!entry->retrievalSignaled) {
+      entry->retrievalSignaled = true;
       entry->retrievedPromise.set_value();
-    } catch (const std::future_error&) {
-      // Promise already satisfied — safe to ignore.
     }
   }
 
