@@ -28,6 +28,22 @@
 
 namespace facebook::velox::cudf_velox {
 namespace {
+std::optional<cudf::type_id> subfieldDecimalType(const TypePtr& type) {
+  if (!type->isDecimal()) {
+    return std::nullopt;
+  }
+
+  // The cuDF-generated TPC-DS files use compact Parquet decimal encodings.
+  // Selecting a type for arbitrary Parquet files requires passing the split's
+  // physical schema into this conversion.
+  const auto [precision, _] = getDecimalPrecisionScale(*type);
+  if (precision <= std::numeric_limits<int32_t>::digits10) {
+    return cudf::type_id::DECIMAL32;
+  }
+  return type->kind() == TypeKind::BIGINT ? cudf::type_id::DECIMAL64
+                                          : cudf::type_id::DECIMAL128;
+}
+
 std::pair<int128_t, int128_t> getInt128BoundsForType(const TypePtr& type) {
   if (type->isDecimal()) {
     const auto [precision, _] = getDecimalPrecisionScale(*type);
@@ -37,6 +53,27 @@ std::pair<int128_t, int128_t> getInt128BoundsForType(const TypePtr& type) {
   return {
       std::numeric_limits<int128_t>::min(),
       std::numeric_limits<int128_t>::max()};
+}
+
+const cudf::ast::expression& buildEqualityExpr(
+    cudf::ast::tree& tree,
+    const cudf::ast::expression& columnRef,
+    const cudf::ast::expression& literal,
+    bool isDecimal) {
+  using Op = cudf::ast::ast_operator;
+  using Operation = cudf::ast::operation;
+
+  if (!isDecimal) {
+    return tree.push(Operation{Op::EQUAL, columnRef, literal});
+  }
+
+  // cuDF's Parquet Bloom-filter path cannot probe fixed-point literals. Keep
+  // the equivalent row and statistics predicate while avoiding that optional
+  // optimization.
+  auto const& lower =
+      tree.push(Operation{Op::GREATER_EQUAL, columnRef, literal});
+  auto const& upper = tree.push(Operation{Op::LESS_EQUAL, columnRef, literal});
+  return tree.push(Operation{Op::NULL_LOGICAL_AND, lower, upper});
 }
 
 template <
@@ -132,7 +169,12 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
     using ValueT = std::decay_t<decltype(lower)>;
 
     const auto [minBound, maxBound] = [&]() -> std::pair<ValueT, ValueT> {
-      if constexpr (std::is_same_v<FilterT, common::HugeintRange>) {
+      if (columnTypePtr->isDecimal()) {
+        const auto [decimalMin, decimalMax] =
+            getInt128BoundsForType(columnTypePtr);
+        return {
+            static_cast<ValueT>(decimalMin), static_cast<ValueT>(decimalMax)};
+      } else if constexpr (std::is_same_v<FilterT, common::HugeintRange>) {
         return getInt128BoundsForType(columnTypePtr);
       } else {
         return {
@@ -146,8 +188,11 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
 
     auto addLiteral = [&](ValueT value) -> const cudf::ast::expression& {
       variant veloxVariant = static_cast<NativeT>(value);
-      const auto& literal =
-          makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars);
+      const auto& literal = makeScalarAndLiteral<Kind>(
+          columnTypePtr,
+          veloxVariant,
+          scalars,
+          subfieldDecimalType(columnTypePtr));
       return tree.push(literal);
     };
 
@@ -158,7 +203,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
         return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
       }
       auto const& literal = addLiteral(lower);
-      return tree.push(Operation{Op::EQUAL, columnRef, literal});
+      return buildEqualityExpr(
+          tree, columnRef, literal, columnTypePtr->isDecimal());
     }
 
     // Range comparison: column >= lower AND column <= upper.
@@ -230,11 +276,19 @@ const cudf::ast::expression& buildValuesListExpr(
   std::vector<const cudf::ast::expression*> exprVec;
   for (const auto& value : values) {
     variant veloxVariant = static_cast<ValueT>(value);
-    auto const& literal = tree.push(
-        makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars));
-    auto const& equalExpr = tree.push(
-        Operation{isNegated ? Op::NOT_EQUAL : Op::EQUAL, columnRef, literal});
-    exprVec.push_back(&equalExpr);
+    auto const& literal = tree.push(makeScalarAndLiteral<Kind>(
+        columnTypePtr,
+        veloxVariant,
+        scalars,
+        subfieldDecimalType(columnTypePtr)));
+    if (isNegated) {
+      auto const& notEqualExpr =
+          tree.push(Operation{Op::NOT_EQUAL, columnRef, literal});
+      exprVec.push_back(&notEqualExpr);
+    } else {
+      exprVec.push_back(&buildEqualityExpr(
+          tree, columnRef, literal, columnTypePtr->isDecimal()));
+    }
   }
 
   const cudf::ast::expression* result = exprVec[0];
@@ -308,12 +362,14 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
       }
 
       variant veloxVariant = static_cast<NativeT>(value);
-      const auto& literal =
-          makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars);
+      const auto& literal = makeScalarAndLiteral<Kind>(
+          columnTypePtr,
+          veloxVariant,
+          scalars,
+          subfieldDecimalType(columnTypePtr));
       auto const& cudfLiteral = tree.push(literal);
-      auto const& equalExpr =
-          tree.push(Operation{Op::EQUAL, columnRef, cudfLiteral});
-      exprVec.push_back(&equalExpr);
+      exprVec.push_back(&buildEqualityExpr(
+          tree, columnRef, cudfLiteral, columnTypePtr->isDecimal()));
     }
 
     if (exprVec.empty()) {

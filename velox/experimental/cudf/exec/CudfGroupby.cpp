@@ -44,7 +44,7 @@
 namespace {
 
 using namespace facebook::velox;
-using cudf_velox::castDecimal64InputToDecimal128;
+using cudf_velox::castDecimalInputToDecimal128;
 using cudf_velox::CountInputKind;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::get_output_mr;
@@ -153,7 +153,7 @@ struct GroupbySumAggregator : GroupbyAggregator {
 };
 
 // Decimal SUM and AVG need to serialize their intermediate sum/count state
-// into Velox VARBINARY and accumulate DECIMAL64 input in DECIMAL128. They
+// into Velox VARBINARY and accumulate narrow decimal input in DECIMAL128. They
 // therefore cannot use the generic sum/mean request paths. These aggregators
 // retain decoded and casted columns because the cuDF aggregation requests hold
 // non-owning views of those columns until groupby execution completes.
@@ -210,7 +210,7 @@ void addDecimalRawPartialSingleSumRequest(
     GroupbyAggregationResultRef& sumRef,
     GroupbyAggregationResultRef& countRef,
     std::unique_ptr<cudf::column>& castedInput) {
-  auto inputView = castDecimal64InputToDecimal128(
+  auto inputView = castDecimalInputToDecimal128(
       builder.tableView().column(inputIndex), castedInput, stream);
   sumRef = builder.addAggregationForValues(
       inputView, cudf::make_sum_aggregation<cudf::groupby_aggregation>());
