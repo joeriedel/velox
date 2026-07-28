@@ -73,7 +73,7 @@ struct MetaSendContext {
 };
 
 struct DataSendContext {
-  std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxGpuPayload> data;
   std::shared_ptr<UcxOutputQueue> outputQueue;
   int destination{0};
   int64_t bytes{0};
@@ -103,7 +103,7 @@ struct OutputQueueCallbackContext {
   }
 
   void releaseIfDequeued(
-      const std::shared_ptr<cudf::packed_columns>& data,
+      const std::shared_ptr<UcxGpuPayload>& data,
       int destination) {
     if (!data) {
       return;
@@ -114,7 +114,8 @@ struct OutputQueueCallbackContext {
       queue = outputQueue.lock();
     }
     if (queue) {
-      queue->releaseInFlightBytes(destination, data->gpu_data->size(), 1L);
+      queue->releaseInFlightBytes(
+          destination, data->data->gpu_data->size(), 1L);
     }
   }
 
@@ -462,7 +463,7 @@ void UcxExchangeServer::installDataCallback() {
   auto callbackContext = std::make_shared<OutputQueueCallbackContext>();
   auto notify =
       [weakQueue, callbackContext, destination = partitionKey_.destination](
-          std::shared_ptr<cudf::packed_columns> data,
+          std::shared_ptr<UcxGpuPayload> data,
           std::vector<int64_t> /*remainingBytes*/) {
         auto self = weakQueue.lock();
         if (!self || self->closed_.load(std::memory_order_acquire)) {
@@ -485,15 +486,14 @@ void UcxExchangeServer::installDataCallback() {
   }
 }
 
-void UcxExchangeServer::onDataAvailable(
-    std::shared_ptr<cudf::packed_columns> data) {
+void UcxExchangeServer::onDataAvailable(std::shared_ptr<UcxGpuPayload> data) {
   if (closed_.load(std::memory_order_acquire) ||
       abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
     if (data) {
       VELOX_CHECK_NOT_NULL(
           outputQueue_, "Dequeued GPU data has no stable output queue");
       outputQueue_->releaseInFlightBytes(
-          partitionKey_.destination, data->gpu_data->size(), 1L);
+          partitionKey_.destination, data->data->gpu_data->size(), 1L);
     }
     return;
   }
@@ -556,8 +556,8 @@ void UcxExchangeServer::sendData() {
   VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_
           << "] sendData hasData=" << (dataPtr_ != nullptr)
-          << (dataPtr_ && dataPtr_->gpu_data
-                  ? " size=" + std::to_string(dataPtr_->gpu_data->size())
+          << (dataPtr_ && dataPtr_->data && dataPtr_->data->gpu_data
+                  ? " size=" + std::to_string(dataPtr_->data->gpu_data->size())
                   : "");
 
   if (!dataPtr_) {
@@ -567,7 +567,7 @@ void UcxExchangeServer::sendData() {
 
   if (isIntraNodeTransfer_) {
     sendStart_ = std::chrono::high_resolution_clock::now();
-    bytes_ = dataPtr_->gpu_data->size();
+    bytes_ = dataPtr_->data->gpu_data->size();
 
     VLOG(3) << "@" << partitionKey_.taskId
             << " Intra-node transfer: publishing data for sequence "
@@ -589,13 +589,14 @@ void UcxExchangeServer::sendData() {
 
   auto data = std::move(dataPtr_);
   VELOX_CHECK_NOT_NULL(outputQueue_);
-  bytes_ = data->gpu_data->size();
+  bytes_ = data->data->gpu_data->size();
 
   MetadataMsg metadataMsg;
   // Copy metadata because broadcast destinations can share packed_columns.
   metadataMsg.cudfMetadata =
-      std::make_unique<std::vector<uint8_t>>(*data->metadata);
+      std::make_unique<std::vector<uint8_t>>(*data->data->metadata);
   metadataMsg.dataSizeBytes = bytes_;
+  metadataMsg.numRows = data->numRows;
   metadataMsg.remainingBytes = {};
   metadataMsg.atEnd = false;
   auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
@@ -644,8 +645,8 @@ void UcxExchangeServer::sendData() {
       metaCtx);
 
   VLOG(3) << "@" << partitionKey_.taskId << " Sending rmm::buffer: " << std::hex
-          << data->gpu_data.get()
-          << " pointing to device memory: " << data->gpu_data->data()
+          << data->data->gpu_data.get()
+          << " pointing to device memory: " << data->data->gpu_data->data()
           << std::dec << " to task " << partitionKey_.toString() << ":"
           << sequenceNumber_ << " of size " << bytes_;
 
@@ -657,8 +658,8 @@ void UcxExchangeServer::sendData() {
   std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
 
   dataRequest_ = endpointRef_->endpoint_->tagSend(
-      dataCtx->data->gpu_data->data(),
-      dataCtx->data->gpu_data->size(),
+      dataCtx->data->data->gpu_data->data(),
+      dataCtx->data->data->gpu_data->size(),
       ucxx::Tag{dataTag},
       false,
       [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
@@ -704,6 +705,7 @@ void UcxExchangeServer::sendFinalMetadata() {
   MetadataMsg metadataMsg;
   metadataMsg.cudfMetadata = nullptr;
   metadataMsg.dataSizeBytes = 0;
+  metadataMsg.numRows = 0;
   metadataMsg.remainingBytes = {};
   metadataMsg.atEnd = true;
   auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
@@ -871,7 +873,7 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
 }
 
 void UcxExchangeServer::releasePendingData() {
-  std::shared_ptr<cudf::packed_columns> pending;
+  std::shared_ptr<UcxGpuPayload> pending;
   {
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
     pending = std::move(dataPtr_);
@@ -882,7 +884,7 @@ void UcxExchangeServer::releasePendingData() {
   VELOX_CHECK_NOT_NULL(
       outputQueue_, "Dequeued GPU data has no stable output queue");
   outputQueue_->releaseInFlightBytes(
-      partitionKey_.destination, pending->gpu_data->size(), 1L);
+      partitionKey_.destination, pending->data->gpu_data->size(), 1L);
 }
 
 void UcxExchangeServer::releaseIntraNodeInFlightBytes() {

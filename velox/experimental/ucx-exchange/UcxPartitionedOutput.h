@@ -119,6 +119,7 @@ class UcxPartitionedOutput : public exec::Operator,
     std::unique_ptr<cudf::table> tableOwner;
     std::vector<cudf_velox::CudfVectorPtr> vectorOwners;
     cudf::table_view tableView;
+    int64_t numRows{0};
     int64_t estimatedBytes{0};
     rmm::cuda_stream_view stream;
   };
@@ -177,6 +178,7 @@ class UcxPartitionedOutput : public exec::Operator,
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
   const size_t numPartitions_;
+  const core::PartitionedOutputNode::Kind kind_;
 
   const int pipelineId_;
   const int driverId_;
@@ -190,6 +192,7 @@ class UcxPartitionedOutput : public exec::Operator,
 
   // Used for switching columns when column order differs between input and
   // output.
+  bool needsRemap_{false};
   std::vector<uint32_t> remap_;
 
   /// Concatenates pending inputs and partitions/enqueues the merged result.

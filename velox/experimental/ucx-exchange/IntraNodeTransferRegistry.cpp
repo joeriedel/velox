@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include <glog/logging.h>
+#include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -31,7 +32,7 @@ IntraNodeTransferRegistry::getInstance() {
 
 std::future<void> IntraNodeTransferRegistry::publish(
     const IntraNodeTransferKey& key,
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     bool atEnd) {
   std::shared_ptr<IntraNodeTransferEntry> entry;
   std::future<void> future;

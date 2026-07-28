@@ -274,13 +274,20 @@ constexpr uint32_t kMetaHeaderSize = sizeof(kMagicNumber) + sizeof(uint32_t);
 /// ensures serialize() and deserializeMetadataMsg() agree on field widths.
 using WireLengthType = uint64_t;
 using WireDataSizeType = int64_t;
+using WireRowCountType = int32_t;
 using WireRemainingElementType = int64_t;
 
 struct MetadataMsg {
   std::unique_ptr<std::vector<uint8_t>> cudfMetadata;
-  WireDataSizeType dataSizeBytes;
+  WireDataSizeType dataSizeBytes{0};
+  /// Logical row count of the source vector. Unlike a cuDF table's row count,
+  /// this remains meaningful for zero-column tables. -1 denotes metadata from
+  /// an older sender that did not include this trailing field. Legacy records
+  /// remain structurally parseable, but zero-column correctness requires a
+  /// homogeneous rollout with this field present at both ends.
+  WireRowCountType numRows{-1};
   std::vector<WireRemainingElementType> remainingBytes;
-  bool atEnd;
+  bool atEnd{false};
 
   uint32_t getSerializedSize() const {
     // The header: the magic number and the metadata length.
@@ -296,6 +303,10 @@ struct MetadataMsg {
     totalSize += remainingBytes.size() * sizeof(remainingBytes[0]);
     // atEnd, encoded in a byte.
     totalSize += sizeof(uint8_t);
+    // Logical row count is a trailing extension, preserving structural wire
+    // compatibility: older receivers ignore it and newer receivers can parse
+    // legacy records. Zero-column logical rows require upgraded peers.
+    totalSize += sizeof(numRows);
 
     return totalSize;
   }

@@ -180,7 +180,11 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
 
   // Get the packed_table and stream from the PackedTableWithStream
   PackedTableWithStream& data = *currentData_;
-  auto numRows = data.packedTable->table.num_rows();
+  const auto numRows = data.numRows;
+  VELOX_CHECK_GE(numRows, 0);
+  if (data.packedTable->table.num_columns() > 0) {
+    VELOX_CHECK_EQ(data.packedTable->table.num_rows(), numRows);
+  }
   auto gpuDataSize = data.gpuDataSize();
   auto stream = data.stream;
   cudf_velox::CudfVector::ReleaseCallback releaseCallback;

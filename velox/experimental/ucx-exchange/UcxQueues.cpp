@@ -43,18 +43,16 @@ int64_t multiplySaturated(int64_t value, int64_t multiplier) {
 }
 } // namespace
 
-void UcxDestinationQueue::Stats::recordEnqueue(
-    const cudf::packed_columns* data) {
+void UcxDestinationQueue::Stats::recordEnqueue(const UcxGpuPayload* data) {
   if (data != nullptr) {
-    bytesQueued += data->gpu_data->size();
+    bytesQueued += data->data->gpu_data->size();
     packedColumnsQueued++;
   }
 }
 
-void UcxDestinationQueue::Stats::recordDequeue(
-    const cudf::packed_columns* data) {
+void UcxDestinationQueue::Stats::recordDequeue(const UcxGpuPayload* data) {
   if (data != nullptr) {
-    const int64_t size = data->gpu_data->size();
+    const int64_t size = data->data->gpu_data->size();
 
     bytesQueued -= size;
     VELOX_DCHECK_GE(bytesQueued, 0, "bytesQueued must be non-negative");
@@ -69,8 +67,7 @@ void UcxDestinationQueue::Stats::recordDequeue(
   }
 }
 
-void UcxDestinationQueue::enqueueBack(
-    std::shared_ptr<cudf::packed_columns> data) {
+void UcxDestinationQueue::enqueueBack(std::shared_ptr<UcxGpuPayload> data) {
   // drop duplicate end markers.
   if (data == nullptr && !queue_.empty() && queue_.back() == nullptr) {
     return;
@@ -82,8 +79,7 @@ void UcxDestinationQueue::enqueueBack(
   queue_.push_back(std::move(data));
 }
 
-void UcxDestinationQueue::enqueueFront(
-    std::shared_ptr<cudf::packed_columns> data) {
+void UcxDestinationQueue::enqueueFront(std::shared_ptr<UcxGpuPayload> data) {
   // ignore nullptr.
   if (data == nullptr) {
     return;
@@ -114,7 +110,7 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
       VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
       break;
     }
-    remainingBytes.push_back(queue_[i]->gpu_data->size());
+    remainingBytes.push_back(queue_[i]->data->gpu_data->size());
   }
   return {std::move(data), std::move(remainingBytes), true};
 }
@@ -253,7 +249,7 @@ void UcxOutputQueue::addOutputBuffersLocked(int numBuffers) {
         buffer->enqueueBack(data);
         // Each backfilled payload will be dequeued and accounted independently
         // for this destination.
-        queuedBytes_ += data->gpu_data->size();
+        queuedBytes_ += data->data->gpu_data->size();
         queuedPackedColumns_++;
       }
     }
@@ -290,6 +286,7 @@ void UcxOutputQueue::enqueue(
     int64_t transferReservationBytes) {
   VELOX_CHECK_NOT_NULL(data);
   VELOX_CHECK_NOT_NULL(task_);
+  VELOX_CHECK_GE(numRows, 0);
   VELOX_CHECK_GE(transferReservationBytes, 0);
   if (!task_->isRunning()) {
     std::vector<ContinuePromise> transferPromises;
@@ -310,7 +307,8 @@ void UcxOutputQueue::enqueue(
   {
     std::lock_guard<std::mutex> l(mutex_);
     auto numBytes = data->gpu_data->size();
-    auto sharedData = std::shared_ptr<cudf::packed_columns>(std::move(data));
+    auto sharedData = std::make_shared<UcxGpuPayload>(UcxGpuPayload{
+        std::shared_ptr<cudf::packed_columns>(std::move(data)), numRows});
 
     bool success = false;
     if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast) {
@@ -762,9 +760,9 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
       // the callback is still executing.
       std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
       data = queue->getData([destination, notify, weakSelf](
-                                std::shared_ptr<cudf::packed_columns> data,
+                                std::shared_ptr<UcxGpuPayload> data,
                                 std::vector<int64_t> remainingBytes) {
-        int64_t bytes = data ? data->gpu_data->size() : -1L;
+        int64_t bytes = data ? data->data->gpu_data->size() : -1L;
         if (bytes >= 0L) {
           auto self = weakSelf.lock();
           if (self) {
@@ -785,7 +783,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         // Need to update the stats here. The data is retained by the server
         // until transfer completion.
         updateStatsWithDequeuedLocked(
-            data.data->gpu_data->size(), 1L, promises);
+            data.data->data->gpu_data->size(), 1L, promises);
       }
     } else {
       data = UcxDestinationQueue::Data{nullptr, {}, true};
@@ -868,7 +866,7 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
 
 bool UcxOutputQueue::enqueuePartitionedOutputLocked(
     int destination,
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     std::vector<UcxDataAvailable>& dataAvailableCbs,
     int64_t transferReservationBytes) {
   VELOX_DCHECK(dataAvailableCbs.empty());
@@ -972,7 +970,7 @@ void UcxOutputQueue::collectAllTransferPromisesLocked(
 }
 
 void UcxOutputQueue::enqueueBroadcastOutputLocked(
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     std::vector<UcxDataAvailable>& dataAvailableCbs) {
   VELOX_DCHECK(dataAvailableCbs.empty());
 
@@ -990,7 +988,7 @@ void UcxOutputQueue::enqueueBroadcastOutputLocked(
 }
 
 void UcxOutputQueue::enqueueArbitraryOutputLocked(
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     std::vector<UcxDataAvailable>& dataAvailableCbs) {
   VELOX_DCHECK(dataAvailableCbs.empty());
 
@@ -1013,7 +1011,7 @@ void UcxOutputQueue::enqueueArbitraryOutputLocked(
         pending.remainingBytes.clear();
         for (const auto& item : arbitraryBuffer_) {
           if (item != nullptr) {
-            pending.remainingBytes.push_back(item->gpu_data->size());
+            pending.remainingBytes.push_back(item->data->gpu_data->size());
           }
         }
         dataAvailableCbs.push_back(std::move(pending));

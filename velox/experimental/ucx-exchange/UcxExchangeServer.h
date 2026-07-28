@@ -129,7 +129,7 @@ class UcxExchangeServer
   void sendData();
 
   /// Handles data becoming available from the output queue.
-  void onDataAvailable(std::shared_ptr<cudf::packed_columns> data);
+  void onDataAvailable(std::shared_ptr<UcxGpuPayload> data);
 
   /// Handles completion of one non-terminal metadata send.
   void metadataSendComplete(ucs_status_t status);
@@ -201,7 +201,7 @@ class UcxExchangeServer
   bool isIntraNodeTransfer_{false};
 
   std::atomic<ServerState> state_;
-  std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
+  std::shared_ptr<UcxGpuPayload> dataPtr_{nullptr};
   /// Protects dataPtr_ across queue callbacks, state-machine dispatch, and
   /// close/error cleanup paths.
   std::recursive_mutex dataMutex_;

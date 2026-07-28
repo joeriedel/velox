@@ -873,8 +873,17 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
           cudf::packed_table{tableView, std::move(packedCols)});
 
       // Bundle the packed_table with the stream used for allocation.
+      auto numRows = ptr->metadata.numRows;
+      if (numRows < 0) {
+        VELOX_CHECK_GT(
+            tableView.num_columns(),
+            0,
+            "Legacy UCX metadata cannot represent logical rows for a "
+            "zero-column payload; upgrade producer and consumer together");
+        numRows = tableView.num_rows();
+      }
       data = std::make_unique<PackedTableWithStream>(
-          std::move(packedTable), ptr->stream);
+          std::move(packedTable), ptr->stream, numRows);
     } catch (const std::exception& e) {
       releaseReceiveBytes(ptr);
       activeDataReceive_.reset();
@@ -1184,7 +1193,7 @@ void UcxExchangeSource::waitForIntraNodeData() {
 }
 
 void UcxExchangeSource::onIntraNodeData(
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     bool atEnd) {
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onIntraNodeData called after close, ignoring";
@@ -1230,16 +1239,16 @@ void UcxExchangeSource::onIntraNodeData(
 
   VLOG(3) << toString()
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
-          << " size=" << data->gpu_data->size();
+          << " size=" << data->data->gpu_data->size();
 
   metrics_.numPackedColumns_.addValue(1);
-  metrics_.totalBytes_.addValue(data->gpu_data->size());
+  metrics_.totalBytes_.addValue(data->data->gpu_data->size());
 
   PackedTableWithStreamPtr tableWithStream;
   try {
     // Convert packed_columns to PackedTableWithStream for the queue.
     cudf::packed_columns packedCols(
-        std::move(data->metadata), std::move(data->gpu_data));
+        std::move(data->data->metadata), std::move(data->data->gpu_data));
 
     cudf::table_view tableView = cudf::unpack(packedCols);
     auto packedTable = std::make_unique<cudf::packed_table>(
@@ -1248,8 +1257,8 @@ void UcxExchangeSource::onIntraNodeData(
     // The producer synchronized before publishing, so the GPU data is ready.
     auto stream =
         facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-    tableWithStream =
-        std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+    tableWithStream = std::make_unique<PackedTableWithStream>(
+        std::move(packedTable), stream, data->numRows);
   } catch (const std::exception& e) {
     ++sequenceNumber_;
     failAndStartAbortDrain(fmt::format(

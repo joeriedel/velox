@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
@@ -94,7 +95,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
         taskId,
         destination,
         [destination, expectedEndMarker, &receivedData](
-            std::shared_ptr<cudf::packed_columns> data,
+            std::shared_ptr<UcxGpuPayload> data,
             std::vector<int64_t> remainingBytes) {
           ASSERT_EQ(expectedEndMarker, data == nullptr)
               << "for destination " << destination;
@@ -107,7 +108,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
       int destination,
       bool& receivedEndMarker) {
     return [destination, &receivedEndMarker](
-               std::shared_ptr<cudf::packed_columns> data,
+               std::shared_ptr<UcxGpuPayload> data,
                std::vector<int64_t> remainingBytes) {
       EXPECT_FALSE(receivedEndMarker) << "for destination " << destination;
       EXPECT_TRUE(data == nullptr) << "for destination " << destination;
@@ -141,7 +142,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
   UcxDataAvailableCallback receiveData(int destination, bool& receivedData) {
     receivedData = false;
     return [destination, &receivedData](
-               std::shared_ptr<cudf::packed_columns> data,
+               std::shared_ptr<UcxGpuPayload> data,
                std::vector<int64_t> /*remainingBytes*/) {
       EXPECT_FALSE(receivedData) << "for destination " << destination;
       EXPECT_TRUE(data != nullptr) << "for destination " << destination;
@@ -178,7 +179,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
       queueManager_->getData(
           taskId,
           destination,
-          [&](std::shared_ptr<cudf::packed_columns> data,
+          [&](std::shared_ptr<UcxGpuPayload> data,
               std::vector<int64_t> /*remainingBytes*/) {
             if (data == nullptr) {
               atEnd = true;
@@ -196,7 +197,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
     // out of order requests are allowed (fetch after delete)
     {
       struct Response {
-        std::shared_ptr<cudf::packed_columns> data;
+        std::shared_ptr<UcxGpuPayload> data;
         std::vector<int64_t> remainingBytes;
       };
       folly::Promise<Response> promise;
@@ -205,7 +206,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
           taskId,
           destination,
           [&promise](
-              std::shared_ptr<cudf::packed_columns> data,
+              std::shared_ptr<UcxGpuPayload> data,
               std::vector<int64_t> remainingBytes) {
             promise.setValue(
                 Response{std::move(data), std::move(remainingBytes)});
@@ -308,6 +309,70 @@ TEST(GpuAbortProtocolTest, usesDedicatedTaskScopedControlTags) {
   EXPECT_EQ(abort.magic, kGpuAbortMagic);
   EXPECT_EQ(abort.version, kGpuAbortVersion);
   EXPECT_EQ(abort.headerSize, sizeof(GpuAbortHeader));
+}
+
+TEST(GpuMetadataProtocolTest, preservesLogicalRowCount) {
+  MetadataMsg metadata;
+  metadata.cudfMetadata = std::make_unique<std::vector<uint8_t>>(
+      std::initializer_list<uint8_t>{1, 2, 3, 4});
+  metadata.dataSizeBytes = 37;
+  metadata.numRows = 123;
+  metadata.remainingBytes = {19, 7};
+  metadata.atEnd = false;
+
+  auto [serialized, size] = metadata.serialize();
+  EXPECT_EQ(size, metadata.getSerializedSize());
+
+  auto decoded = MetadataMsg::deserializeMetadataMsg(serialized.get());
+  EXPECT_EQ(*decoded.cudfMetadata, *metadata.cudfMetadata);
+  EXPECT_EQ(decoded.dataSizeBytes, metadata.dataSizeBytes);
+  EXPECT_EQ(decoded.numRows, metadata.numRows);
+  EXPECT_EQ(decoded.remainingBytes, metadata.remainingBytes);
+  EXPECT_EQ(decoded.atEnd, metadata.atEnd);
+
+  // Older workers end the message immediately after atEnd. New readers keep
+  // accepting that layout and infer the count from column-bearing tables.
+  std::vector<uint8_t> legacy(
+      serialized.get(), serialized.get() + size - sizeof(WireRowCountType));
+  const auto legacySize = static_cast<uint32_t>(legacy.size());
+  std::memcpy(
+      legacy.data() + sizeof(kMagicNumber), &legacySize, sizeof(legacySize));
+  auto legacyDecoded = MetadataMsg::deserializeMetadataMsg(legacy.data());
+  EXPECT_EQ(legacyDecoded.numRows, -1);
+  EXPECT_EQ(legacyDecoded.dataSizeBytes, metadata.dataSizeBytes);
+  EXPECT_EQ(legacyDecoded.remainingBytes, metadata.remainingBytes);
+  EXPECT_EQ(legacyDecoded.atEnd, metadata.atEnd);
+}
+
+TEST_F(UcxOutputQueueManagerTest, preservesLogicalRowCount) {
+  const std::string taskId = "logical-row-count";
+  constexpr int32_t kNumRows = 17;
+  initializeTask(taskId, 1, 1);
+
+  auto emptyTable = std::make_unique<cudf::table>();
+  auto packed = std::make_unique<cudf::packed_columns>(
+      cudf::pack(emptyTable->view(), rmm::cuda_stream_default));
+  rmm::cuda_stream_default.synchronize();
+  queueManager_->enqueue(taskId, 0, std::move(packed), kNumRows);
+
+  std::shared_ptr<UcxGpuPayload> received;
+  queueManager_->getData(
+      taskId,
+      0,
+      [&received](
+          std::shared_ptr<UcxGpuPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        received = std::move(data);
+      });
+
+  ASSERT_NE(received, nullptr);
+  EXPECT_EQ(received->numRows, kNumRows);
+  const auto bytes = received->data->gpu_data->size();
+  received.reset();
+  queueManager_->releaseInFlightBytes(taskId, 0, bytes, 1);
+  noMoreData(taskId);
+  fetchEndMarker(taskId, 0);
+  queueManager_->removeTask(taskId);
 }
 
 TEST_F(
@@ -569,7 +634,7 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
 
   // Fetch data from a non-existing task.
   struct Response {
-    std::shared_ptr<cudf::packed_columns> data;
+    std::shared_ptr<UcxGpuPayload> data;
     std::vector<int64_t> remainingBytes;
   };
   folly::Promise<Response> promise;
@@ -578,7 +643,7 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
       taskId,
       destination,
       [&promise](
-          std::shared_ptr<cudf::packed_columns> data,
+          std::shared_ptr<UcxGpuPayload> data,
           std::vector<int64_t> remainingBytes) {
         promise.setValue(Response{std::move(data), std::move(remainingBytes)});
       });
@@ -603,7 +668,7 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
         taskId,
         destination,
         [&promise](
-            std::shared_ptr<cudf::packed_columns> data,
+            std::shared_ptr<UcxGpuPayload> data,
             std::vector<int64_t> remainingBytes) {
           promise.setValue(
               Response{std::move(data), std::move(remainingBytes)});
@@ -685,7 +750,7 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateBeforeInit) {
       taskId,
       0, // destination
       [&callbackFired, &receivedNullptr](
-          std::shared_ptr<cudf::packed_columns> data,
+          std::shared_ptr<UcxGpuPayload> data,
           std::vector<int64_t> remainingBytes) {
         callbackFired = true;
         receivedNullptr = (data == nullptr);
@@ -721,7 +786,7 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
       taskId,
       0,
       [&callback0Fired, &callback0Nullptr](
-          std::shared_ptr<cudf::packed_columns> data,
+          std::shared_ptr<UcxGpuPayload> data,
           std::vector<int64_t> remainingBytes) {
         callback0Fired = true;
         callback0Nullptr = (data == nullptr);
@@ -730,7 +795,7 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
       taskId,
       1,
       [&callback1Fired, &callback1Nullptr](
-          std::shared_ptr<cudf::packed_columns> data,
+          std::shared_ptr<UcxGpuPayload> data,
           std::vector<int64_t> remainingBytes) {
         callback1Fired = true;
         callback1Nullptr = (data == nullptr);
@@ -858,7 +923,7 @@ TEST_F(
         taskId,
         1,
         [&receivedData](
-            std::shared_ptr<cudf::packed_columns> data,
+            std::shared_ptr<UcxGpuPayload> data,
             std::vector<int64_t> /*remainingBytes*/) {
           ASSERT_NE(data, nullptr);
           ++receivedData;

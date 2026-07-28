@@ -117,6 +117,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           fmt::format("[{}]", planNode->id())),
       queueManager_(std::move(queueManager)),
       numPartitions_(planNode->numPartitions()),
+      kind_(planNode->kind()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
@@ -124,6 +125,11 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           CudfConfig::getInstance().partitionedOutputBatchRows)),
       initialPayloadBytes_(
           std::max<uint64_t>(ctx->queryConfig().maxOutputBufferSize(), 1)) {
+  if (planNode->outputType()->size() == 0 && !planNode->keys().empty()) {
+    VELOX_UNSUPPORTED(
+        "UCX partitioned output does not support hash partitioning after "
+        "projecting away all output columns");
+  }
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -135,7 +141,8 @@ UcxPartitionedOutput::UcxPartitionedOutput(
   for (int i = 0; i < planNode->outputType()->size(); ++i) {
     outNames.push_back(planNode->outputType()->nameOf(i));
   }
-  if (inNames != outNames) {
+  needsRemap_ = inNames != outNames;
+  if (needsRemap_) {
     getRemapping(inNames, outNames, remap_);
   }
 }
@@ -157,7 +164,7 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
     lockedStats->addOutputVector(inputBytes, input->size());
   }
 
-  pendingRows_ += cudfVector->getTableView().num_rows();
+  pendingRows_ += input->size();
   pendingBytes_ += inputBytes;
   pendingInputs_.push_back(std::move(cudfVector));
 
@@ -245,6 +252,81 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
 
   try {
     auto queueManager = sharedQueueManager();
+    VELOX_CHECK_GE(input.numRows, 0);
+    if (input.tableView.num_columns() > 0) {
+      VELOX_CHECK_EQ(input.tableView.num_rows(), input.numRows);
+    } else {
+      VELOX_CHECK_EQ(input.tableView.num_rows(), 0);
+      VELOX_CHECK_LE(
+          input.numRows, std::numeric_limits<cudf::size_type>::max());
+
+      // A zero-column cuDF table has no physical row count. Partition the
+      // logical cardinality and send it alongside independently packed empty
+      // schemas. SINGLE/GATHER and broadcast/arbitrary output use destination
+      // zero; the output queue fans out broadcast payloads as needed.
+      struct EmptyPayload {
+        size_t destination;
+        int32_t numRows;
+        std::unique_ptr<cudf::packed_columns> packedColumns;
+      };
+      std::vector<EmptyPayload> payloads;
+      payloads.reserve(numPartitions_);
+      const auto buildEmptyPayload = [&](size_t destination, int64_t numRows) {
+        if (numRows == 0) {
+          return;
+        }
+        auto packedCols = cudf::pack(
+            input.tableView,
+            input.stream,
+            cudf::get_current_device_resource_ref());
+        payloads.push_back(EmptyPayload{
+            destination,
+            static_cast<int32_t>(numRows),
+            std::make_unique<cudf::packed_columns>(
+                std::move(packedCols.metadata),
+                std::move(packedCols.gpu_data))});
+      };
+
+      if (kind_ != core::PartitionedOutputNode::Kind::kPartitioned ||
+          numPartitions_ == 1 || usesHashPartitioning()) {
+        buildEmptyPayload(0, input.numRows);
+      } else {
+        for (size_t partition = 0; partition < numPartitions_; ++partition) {
+          const auto begin = input.numRows * partition / numPartitions_;
+          const auto end = input.numRows * (partition + 1) / numPartitions_;
+          buildEmptyPayload(partition, end - begin);
+        }
+      }
+      input.stream.synchronize();
+
+      // Do not publish a partial logical batch if packing a later destination
+      // runs out of memory. All allocations above must succeed before the first
+      // enqueue.
+      for (auto& payload : payloads) {
+        try {
+          queueManager->enqueue(
+              this->taskId(),
+              payload.destination,
+              std::move(payload.packedColumns),
+              payload.numRows);
+        } catch (const std::bad_alloc&) {
+          // Retrying after any earlier destination was published would
+          // duplicate rows. Convert host queue-allocation failure into a
+          // terminal query error rather than letting the outer retry path
+          // handle it.
+          VELOX_FAIL(
+              "Failed to enqueue zero-column UCX output after payload "
+              "materialization");
+        }
+      }
+
+      pendingInputBatch_.reset();
+      const auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
+      blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
+                                : exec::BlockingReason::kNotBlocked;
+      return;
+    }
+
     if (numPartitions_ > 1) {
       if (usesHashPartitioning()) {
         hashPartition(input.tableView, input.stream, estimatedBytes);
@@ -268,10 +350,7 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
     auto packedColsPtr = std::make_unique<cudf::packed_columns>(
         std::move(packedCols.metadata), std::move(packedCols.gpu_data));
     queueManager->enqueue(
-        this->taskId(),
-        0,
-        std::move(packedColsPtr),
-        input.tableView.num_rows());
+        this->taskId(), 0, std::move(packedColsPtr), input.numRows);
 
     pendingInputBatch_.reset();
     const auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
@@ -301,6 +380,7 @@ void UcxPartitionedOutput::flushPending() {
   }
 
   const auto estimatedBytes = std::max<int64_t>(pendingBytes_, 1);
+  const auto numRows = pendingRows_;
 
   try {
     cudf::table_view tableView;
@@ -309,12 +389,13 @@ void UcxPartitionedOutput::flushPending() {
     std::unique_ptr<cudf::table> mergedTable;
     std::vector<CudfVectorPtr> vectorOwners;
 
-    if (pendingInputs_.size() == 1) {
-      // Fast path: use the single input's view directly (no GPU alloc).
+    if (pendingInputs_.size() == 1 || outputType_->size() == 0) {
+      // Fast path: use a directly owned view (no GPU allocation). Zero-column
+      // inputs can retain all vector owners because no table data is accessed.
       vectorOwners = std::move(pendingInputs_);
-      auto& cv = vectorOwners[0];
+      auto& cv = vectorOwners.back();
       stream = cv->stream();
-      tableView = remap_.empty()
+      tableView = !needsRemap_
           ? cv->getTableView()
           : cv->getTableView().select(remap_.begin(), remap_.end());
     } else {
@@ -326,7 +407,7 @@ void UcxPartitionedOutput::flushPending() {
       for (auto& v : pendingInputs_) {
         inputStreams.push_back(v->stream());
         views.push_back(
-            remap_.empty()
+            !needsRemap_
                 ? v->getTableView()
                 : v->getTableView().select(remap_.begin(), remap_.end()));
       }
@@ -348,6 +429,7 @@ void UcxPartitionedOutput::flushPending() {
         std::move(mergedTable),
         std::move(vectorOwners),
         tableView,
+        numRows,
         estimatedBytes,
         stream});
     pendingRows_ = 0;

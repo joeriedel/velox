@@ -32,12 +32,14 @@ namespace facebook::velox::ucx_exchange {
 struct PackedTableWithStream {
   std::unique_ptr<cudf::packed_table> packedTable;
   rmm::cuda_stream_view stream;
+  int32_t numRows{0};
 
   PackedTableWithStream() = default;
   PackedTableWithStream(
       std::unique_ptr<cudf::packed_table>&& table,
-      rmm::cuda_stream_view s)
-      : packedTable(std::move(table)), stream(s) {}
+      rmm::cuda_stream_view s,
+      int32_t rows)
+      : packedTable(std::move(table)), stream(s), numRows(rows) {}
 
   /// Returns the size of the GPU data buffer, or 0 if packedTable is null.
   size_t gpuDataSize() const {

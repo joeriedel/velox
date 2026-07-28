@@ -27,6 +27,8 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct UcxGpuPayload;
+
 /// @brief Key for identifying intra-node transfer entries in the registry.
 /// Used when UcxExchangeServer and UcxExchangeSource are on the same node.
 struct IntraNodeTransferKey {
@@ -45,7 +47,7 @@ struct IntraNodeTransferKey {
 
 /// @brief Result from intra-node transfer containing data and end marker.
 struct IntraNodeTransferResult {
-  std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxGpuPayload> data;
   bool atEnd{false}; // True if this is the end-of-stream marker
 };
 
@@ -54,7 +56,7 @@ struct IntraNodeTransferResult {
 /// waits on retrievedPromise; the source polls via poll() and fulfils the
 /// promise on retrieval.
 struct IntraNodeTransferEntry {
-  std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxGpuPayload> data;
   bool atEnd{false}; // True if this is the end-of-stream marker
   std::promise<void> retrievedPromise; // Server waits on this after publishing
   std::mutex entryMutex;
@@ -93,7 +95,7 @@ class IntraNodeTransferRegistry {
   /// @return A future that completes when source has retrieved the data
   [[nodiscard]] std::future<void> publish(
       const IntraNodeTransferKey& key,
-      std::shared_ptr<cudf::packed_columns> data,
+      std::shared_ptr<UcxGpuPayload> data,
       bool atEnd);
 
   /// @brief Non-blocking poll for intra-node transfer data.

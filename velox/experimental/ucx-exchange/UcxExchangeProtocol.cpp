@@ -78,6 +78,10 @@ std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {
 
   uint8_t atEndByte = atEnd ? 1 : 0;
   *ptr = atEndByte;
+  ++ptr;
+
+  VELOX_CHECK_GE(numRows, 0, "UCX metadata row count is negative");
+  std::memcpy(ptr, &numRows, sizeof(numRows));
 
   return std::make_pair<std::shared_ptr<uint8_t>, size_t>(
       std::move(buffer), totalSize);
@@ -137,6 +141,18 @@ MetadataMsg MetadataMsg::deserializeMetadataMsg(const uint8_t* buffer) {
     throw std::runtime_error("Insufficient data for atEnd flag");
   }
   record.atEnd = (*ptr != 0);
+  ++ptr;
+
+  // numRows was added as a trailing extension. Metadata produced by older
+  // workers ends after atEnd. This is parse-compatible, but only
+  // column-bearing legacy payloads have an inferable physical row count.
+  const auto trailingBytes = endPtr - ptr;
+  if (trailingBytes == sizeof(record.numRows)) {
+    std::memcpy(&record.numRows, ptr, sizeof(record.numRows));
+    VELOX_CHECK_GE(record.numRows, 0, "UCX metadata row count is negative");
+  } else if (trailingBytes != 0) {
+    throw std::runtime_error("Invalid trailing UCX metadata bytes");
+  }
 
   return record;
 }

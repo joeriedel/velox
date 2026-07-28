@@ -31,6 +31,14 @@
 
 namespace facebook::velox::ucx_exchange {
 
+/// One packed cuDF table plus the logical row count of the source vector.
+/// cuDF tables with zero columns cannot represent a row count, so the count
+/// must travel alongside the packed payload.
+struct UcxGpuPayload {
+  std::shared_ptr<cudf::packed_columns> data;
+  int32_t numRows{0};
+};
+
 /// @brief  Callback function for getting data from the queues.
 /// A nullptr indicates that there is no more data.
 /// The remainingBytes vector contains the sizes for the
@@ -38,7 +46,7 @@ namespace facebook::velox::ucx_exchange {
 /// Uses shared_ptr to support broadcast mode where the same GPU data
 /// is shared across multiple destination queues without copying.
 using UcxDataAvailableCallback = std::function<void(
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxGpuPayload> data,
     std::vector<int64_t> remainingBytes)>;
 
 struct UcxDestinationTransferStats {
@@ -52,7 +60,7 @@ struct UcxDestinationTransferStats {
 
 struct UcxDataAvailable {
   UcxDataAvailableCallback callback{nullptr};
-  std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxGpuPayload> data;
   std::vector<int64_t> remainingBytes;
 
   void notify() {
@@ -71,9 +79,9 @@ struct UcxDataAvailable {
 class UcxDestinationQueue {
  public:
   struct Stats {
-    void recordEnqueue(const cudf::packed_columns* data);
+    void recordEnqueue(const UcxGpuPayload* data);
 
-    void recordDequeue(const cudf::packed_columns* data);
+    void recordDequeue(const UcxGpuPayload* data);
 
     // what has been queued
     int64_t bytesQueued{0};
@@ -91,15 +99,15 @@ class UcxDestinationQueue {
 
   /// @brief Enqueues the data to the back of the queue.
   /// @param data Corresponds to a RowVector
-  void enqueueBack(std::shared_ptr<cudf::packed_columns> data);
+  void enqueueBack(std::shared_ptr<UcxGpuPayload> data);
 
   /// @brief Enqueues the data to the front of the queue. This is needed when
   /// a transfer fails.
   /// @param data
-  void enqueueFront(std::shared_ptr<cudf::packed_columns> data);
+  void enqueueFront(std::shared_ptr<UcxGpuPayload> data);
 
   struct Data {
-    std::shared_ptr<cudf::packed_columns> data;
+    std::shared_ptr<UcxGpuPayload> data;
     std::vector<int64_t> remainingBytes;
     /// Whether the result is returned immediately without invoking the `notify'
     /// callback.
@@ -140,7 +148,7 @@ class UcxDestinationQueue {
  private:
   void clearNotify();
 
-  std::deque<std::shared_ptr<cudf::packed_columns>> queue_;
+  std::deque<std::shared_ptr<UcxGpuPayload>> queue_;
   UcxDataAvailableCallback notify_{nullptr};
   Stats stats_;
 };
@@ -411,7 +419,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   bool enqueuePartitionedOutputLocked(
       int destination,
-      std::shared_ptr<cudf::packed_columns> data,
+      std::shared_ptr<UcxGpuPayload> data,
       std::vector<UcxDataAvailable>& dataAvailableCbs,
       int64_t transferReservationBytes);
 
@@ -430,11 +438,11 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   void collectAllTransferPromisesLocked(std::vector<ContinuePromise>& promises);
 
   void enqueueBroadcastOutputLocked(
-      std::shared_ptr<cudf::packed_columns> data,
+      std::shared_ptr<UcxGpuPayload> data,
       std::vector<UcxDataAvailable>& dataAvailableCbs);
 
   void enqueueArbitraryOutputLocked(
-      std::shared_ptr<cudf::packed_columns> data,
+      std::shared_ptr<UcxGpuPayload> data,
       std::vector<UcxDataAvailable>& dataAvailableCbs);
 
   // Reference to the task that owns this UcxQueue.
@@ -451,10 +459,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // For broadcast: stores data for late-arriving destinations that need
   // backfill. Cleared once noMoreQueues_ is set.
-  std::vector<std::shared_ptr<cudf::packed_columns>> dataToBroadcast_;
+  std::vector<std::shared_ptr<UcxGpuPayload>> dataToBroadcast_;
 
   // For arbitrary: shared pool of data that any consumer can pull from.
-  std::deque<std::shared_ptr<cudf::packed_columns>> arbitraryBuffer_;
+  std::deque<std::shared_ptr<UcxGpuPayload>> arbitraryBuffer_;
 
   // For arbitrary: round-robin index for distributing data to waiting
   // consumers.

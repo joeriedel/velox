@@ -105,7 +105,9 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     int numPartitions,
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
-    const std::unordered_map<std::string, std::string>& extraConfig) {
+    const std::unordered_map<std::string, std::string>& extraConfig,
+    RowTypePtr outputTypeOverride,
+    core::PartitionFunctionSpecPtr partitionFunctionSpecOverride) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -127,6 +129,21 @@ std::shared_ptr<Task> createPartitionedOutputTask(
                           .values({rowVector})
                           .partitionedOutput(partitionKeys, numPartitions)
                           .planFragment();
+  if (outputTypeOverride != nullptr ||
+      partitionFunctionSpecOverride != nullptr) {
+    const auto partitionedOutput =
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+            planFragment.planNode);
+    VELOX_CHECK_NOT_NULL(partitionedOutput);
+    core::PartitionedOutputNode::Builder builder(*partitionedOutput);
+    if (outputTypeOverride != nullptr) {
+      builder.outputType(std::move(outputTypeOverride));
+    }
+    if (partitionFunctionSpecOverride != nullptr) {
+      builder.partitionFunctionSpec(std::move(partitionFunctionSpecOverride));
+    }
+    planFragment.planNode = builder.build();
+  }
 
   std::shared_ptr<folly::Executor> executor(
       std::make_shared<folly::CPUThreadPoolExecutor>(

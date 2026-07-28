@@ -41,6 +41,8 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct UcxGpuPayload;
+
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
@@ -272,7 +274,7 @@ class UcxExchangeSource
   /// @brief For intra-node transfer: handles data retrieved from registry.
   /// @param data The packed_columns from registry (nullptr if atEnd or error)
   /// @param atEnd True if this is end-of-stream
-  void onIntraNodeData(std::shared_ptr<cudf::packed_columns> data, bool atEnd);
+  void onIntraNodeData(std::shared_ptr<UcxGpuPayload> data, bool atEnd);
 
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
