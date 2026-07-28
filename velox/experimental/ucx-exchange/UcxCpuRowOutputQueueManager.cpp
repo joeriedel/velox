@@ -108,7 +108,7 @@ void UcxCpuRowOutputQueueManager::deleteResults(
   }
 }
 
-void UcxCpuRowOutputQueueManager::getData(
+std::shared_ptr<UcxCpuRowOutputQueue> UcxCpuRowOutputQueueManager::getData(
     std::string_view taskId,
     int destination,
     UcxCpuRowDataAvailableCallback notify) {
@@ -138,9 +138,10 @@ void UcxCpuRowOutputQueueManager::getData(
   });
   if (taskRemoved) {
     notify(nullptr, {});
-    return;
+    return nullptr;
   }
   outputQueue->getData(destination, notify);
+  return outputQueue;
 }
 
 std::shared_ptr<UcxCpuRowPayload> UcxCpuRowOutputQueueManager::tryGetData(
@@ -153,18 +154,14 @@ std::shared_ptr<UcxCpuRowPayload> UcxCpuRowOutputQueueManager::tryGetData(
   return queue->tryGetData(destination);
 }
 
-void UcxCpuRowOutputQueueManager::requeueFront(
-    std::string_view taskId,
-    int destination,
-    std::shared_ptr<UcxCpuRowPayload> data) {
-  if (!data) {
-    return;
-  }
-  auto queue = getQueueIfExists(taskId);
-  if (!queue) {
-    return;
-  }
-  queue->requeueFront(destination, std::move(data));
+std::shared_ptr<UcxCpuRowOutputQueue> UcxCpuRowOutputQueueManager::getTaskQueue(
+    std::string_view taskId) {
+  auto queue = getQueue(taskId);
+  VELOX_CHECK(
+      queue->isInitialized(),
+      "CPU row output queue for task {} is not initialized",
+      taskId);
+  return queue;
 }
 
 UcxCpuRowOutputQueueManager::ExchangeServerAdmission
