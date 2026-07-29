@@ -319,7 +319,9 @@ TEST_F(CudfDecimalTest, betweenNormalizesDecimal32Input) {
       "CAST('0.99' AS DECIMAL(7, 2)) AND "
       "CAST('1.49' AS DECIMAL(7, 2))",
       rowType,
-      &execCtx);
+      &execCtx,
+      {},
+      /*enableConstantFolding=*/true);
   auto evaluator = createCudfExpression(expression, rowType);
 
   auto stream = cudf::get_default_stream();
@@ -385,7 +387,8 @@ TEST_F(CudfDecimalTest, divideUsesWidestDecimalStorage) {
 
   auto assertExpression = [&](const std::string& sql,
                               const std::vector<int64_t>& expected) {
-    auto expression = test_utils::compileExecExpr(sql, rowType, &execCtx);
+    auto expression = test_utils::compileExecExpr(
+        sql, rowType, &execCtx, {}, /*enableConstantFolding=*/true);
     auto evaluator = createCudfExpression(expression, rowType);
     auto result = evaluator->eval(inputs, stream, mr);
     auto resultView = asView(result);
@@ -423,7 +426,9 @@ TEST_F(CudfDecimalTest, coalesceNormalizesDecimal32Input) {
       "sales_price - "
       "coalesce(return_amount, CAST('0.00' AS DECIMAL(7, 2)))",
       rowType,
-      &execCtx);
+      &execCtx,
+      {},
+      /*enableConstantFolding=*/true);
   auto evaluator = createCudfExpression(expression, rowType);
 
   auto stream = cudf::get_default_stream();
@@ -456,7 +461,9 @@ TEST_F(CudfDecimalTest, coalescePreservesOwnedFirstInput) {
       "CAST(return_amount AS DECIMAL(12, 2)), "
       "CAST('0.00' AS DECIMAL(12, 2)))",
       rowType,
-      &execCtx);
+      &execCtx,
+      {},
+      /*enableConstantFolding=*/true);
   auto evaluator = createCudfExpression(expression, rowType);
 
   auto stream = cudf::get_default_stream();
