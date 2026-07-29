@@ -28,14 +28,14 @@ set(
 )
 
 set(VELOX_UCXX_VERSION 0.51)
-set(VELOX_UCXX_COMMIT fe38756e340b6c4f5737f65f942f684197a32d12)
+set(VELOX_UCXX_COMMIT a7f9228bbc9fd45b1056758f3a7067f7d5d65947)
 set(
   VELOX_UCXX_BUILD_SHA256_CHECKSUM
-  74ac37c3f0ae4c531966a0cfd138edb5eac2f80854fa5ee299aa05c5073d45f9
+  6ae638a3a86790d5e2b36a06f1ea6bf188e358e4ca3ecb4731cb9aa9145aa19c
 )
 set(
   VELOX_UCXX_SOURCE_URL
-  "https://github.com/rapidsai/ucxx/archive/${VELOX_UCXX_COMMIT}.tar.gz"
+  "https://github.com/kjmph/ucxx/archive/${VELOX_UCXX_COMMIT}.tar.gz"
 )
 
 block(SCOPE_FOR VARIABLES)

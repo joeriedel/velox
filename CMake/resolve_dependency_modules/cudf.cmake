@@ -74,14 +74,15 @@ else()
 endif()
 if(UCX_FOUND)
   message(STATUS "Found UCX: ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched")
-  # ucxx commit fe38756 from 2026-06-22 (release/0.50 branch)
+  # kjmph/ucxx commit based on fe38756 (release/0.50 branch) with
+  # progress-thread control-plane fairness.
   set(VELOX_ucxx_VERSION 0.51)
-  set(VELOX_ucxx_COMMIT fe38756e340b6c4f5737f65f942f684197a32d12)
+  set(VELOX_ucxx_COMMIT a7f9228bbc9fd45b1056758f3a7067f7d5d65947)
   set(
     VELOX_ucxx_BUILD_SHA256_CHECKSUM
-    74ac37c3f0ae4c531966a0cfd138edb5eac2f80854fa5ee299aa05c5073d45f9
+    6ae638a3a86790d5e2b36a06f1ea6bf188e358e4ca3ecb4731cb9aa9145aa19c
   )
-  set(VELOX_ucxx_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/${VELOX_ucxx_COMMIT}.tar.gz")
+  set(VELOX_ucxx_SOURCE_URL "https://github.com/kjmph/ucxx/archive/${VELOX_ucxx_COMMIT}.tar.gz")
   velox_resolve_dependency_url(ucxx)
 else()
   message(STATUS "UCX not found -- ucxx will not be fetched")
