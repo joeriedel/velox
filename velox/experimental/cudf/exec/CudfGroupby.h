@@ -142,7 +142,8 @@ class CudfGroupby : public CudfOperatorBase {
   void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ &&
+        !(flushGroupIdPartialInput_ && bufferedResult_ != nullptr);
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
@@ -195,6 +196,10 @@ class CudfGroupby : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const bool isSingleStep_;
+  // GroupId emits one grouping-set view at a time. Partial aggregation can
+  // reduce each view independently and let the downstream final aggregation
+  // merge duplicate states, avoiding materialization of the expanded input.
+  const bool flushGroupIdPartialInput_;
   // Streaming aggregation is disabled if companion aggregates are present.
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;

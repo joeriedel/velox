@@ -122,9 +122,9 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     cudf::table_view tableView,
-    std::shared_ptr<cudf::table> owner,
+    ViewOwner owner,
     rmm::cuda_stream_view stream,
-    uint64_t flatSize)
+    std::optional<uint64_t> flatSize)
     : RowVector(
           pool,
           std::move(type),
@@ -135,10 +135,29 @@ CudfVector::CudfVector(
       tableStorage_{std::move(owner)},
       tabView_{tableView},
       stream_{stream},
-      flatSize_{flatSize} {
-  VELOX_CHECK_NOT_NULL(std::get<std::shared_ptr<cudf::table>>(tableStorage_));
+      flatSize_{
+          flatSize.has_value() ? flatSize.value()
+                               : estimateTableSize(tableView)} {
+  VELOX_CHECK_NOT_NULL(std::get<ViewOwner>(tableStorage_));
   VELOX_CHECK_EQ(tabView_.num_rows(), size);
 }
+
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view tableView,
+    std::shared_ptr<cudf::table> owner,
+    rmm::cuda_stream_view stream,
+    uint64_t flatSize)
+    : CudfVector(
+          pool,
+          std::move(type),
+          size,
+          tableView,
+          ViewOwner{std::move(owner)},
+          stream,
+          flatSize) {}
 
 CudfVector::~CudfVector() {
   if (auto* tablePtr =
@@ -148,9 +167,7 @@ CudfVector::~CudfVector() {
       auto* packedPtr =
           std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_)) {
     packedPtr->reset();
-  } else if (
-      auto* ownerPtr =
-          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+  } else if (auto* ownerPtr = std::get_if<ViewOwner>(&tableStorage_)) {
     ownerPtr->reset();
   }
   runReleaseCallback();
@@ -191,8 +208,7 @@ std::unique_ptr<cudf::table> CudfVector::release() {
     return materializedTable;
   }
 
-  if (auto* ownerPtr =
-          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+  if (auto* ownerPtr = std::get_if<ViewOwner>(&tableStorage_)) {
     auto materializedTable =
         std::make_unique<cudf::table>(tabView_, stream_, get_output_mr());
     ownerPtr->reset();
@@ -236,8 +252,7 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
     return true;
   }
 
-  if (auto* ownerPtr =
-          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+  if (auto* ownerPtr = std::get_if<ViewOwner>(&tableStorage_)) {
     return *ownerPtr != nullptr && stream_.value() == stream.value();
   }
 
