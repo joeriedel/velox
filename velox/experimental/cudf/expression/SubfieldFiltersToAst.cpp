@@ -24,35 +24,65 @@
 #include <cudf/scalar/scalar_device_view.cuh>
 #include <cudf/types.hpp>
 
+#include <algorithm>
 #include <limits>
 
 namespace facebook::velox::cudf_velox {
 namespace {
-std::optional<cudf::type_id> subfieldDecimalType(const TypePtr& type) {
-  if (!type->isDecimal()) {
+std::optional<cudf::type_id> subfieldDecimalType(
+    const TypePtr& type,
+    const std::string& fieldName,
+    const SubfieldFilterDecimalTypes* decimalTypes) {
+  if (!type->isDecimal() || decimalTypes == nullptr) {
     return std::nullopt;
   }
 
-  // The cuDF-generated TPC-DS files use compact Parquet decimal encodings.
-  // Selecting a type for arbitrary Parquet files requires passing the split's
-  // physical schema into this conversion.
-  const auto [precision, _] = getDecimalPrecisionScale(*type);
-  if (precision <= std::numeric_limits<int32_t>::digits10) {
-    return cudf::type_id::DECIMAL32;
+  if (const auto it = decimalTypes->find(fieldName);
+      it != decimalTypes->end()) {
+    VELOX_CHECK(
+        it->second == cudf::type_id::DECIMAL32 ||
+            it->second == cudf::type_id::DECIMAL64 ||
+            it->second == cudf::type_id::DECIMAL128,
+        "Invalid cuDF decimal storage type for field '{}'",
+        fieldName);
+    return it->second;
   }
-  return type->kind() == TypeKind::BIGINT ? cudf::type_id::DECIMAL64
-                                          : cudf::type_id::DECIMAL128;
+  return std::nullopt;
 }
 
-std::pair<int128_t, int128_t> getInt128BoundsForType(const TypePtr& type) {
+std::pair<int128_t, int128_t> getInt128BoundsForType(
+    const TypePtr& type,
+    std::optional<cudf::type_id> decimalType = std::nullopt) {
   if (type->isDecimal()) {
     const auto [precision, _] = getDecimalPrecisionScale(*type);
     const auto maxAbs = DecimalUtil::kPowersOfTen[precision] - 1;
-    return {-maxAbs, maxAbs};
+    int128_t min = -maxAbs;
+    int128_t max = maxAbs;
+    if (decimalType == cudf::type_id::DECIMAL32) {
+      min = std::max<int128_t>(min, std::numeric_limits<int32_t>::min());
+      max = std::min<int128_t>(max, std::numeric_limits<int32_t>::max());
+    } else if (decimalType == cudf::type_id::DECIMAL64) {
+      min = std::max<int128_t>(min, std::numeric_limits<int64_t>::min());
+      max = std::min<int128_t>(max, std::numeric_limits<int64_t>::max());
+    }
+    return {min, max};
   }
   return {
       std::numeric_limits<int128_t>::min(),
       std::numeric_limits<int128_t>::max()};
+}
+
+template <typename T>
+bool decimalValueIsRepresentable(
+    T value,
+    const TypePtr& type,
+    std::optional<cudf::type_id> decimalType) {
+  if (!type->isDecimal()) {
+    return true;
+  }
+  const auto [min, max] = getInt128BoundsForType(type, decimalType);
+  const auto decimalValue = static_cast<int128_t>(value);
+  return decimalValue >= min && decimalValue <= max;
 }
 
 const cudf::ast::expression& buildEqualityExpr(
@@ -153,7 +183,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
     cudf::ast::tree& tree,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
     const cudf::ast::expression& columnRef,
-    const TypePtr& columnTypePtr) {
+    const TypePtr& columnTypePtr,
+    std::optional<cudf::type_id> decimalType) {
   using NativeT = typename TypeTraits<Kind>::NativeType;
 
   if constexpr (
@@ -171,7 +202,7 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
     const auto [minBound, maxBound] = [&]() -> std::pair<ValueT, ValueT> {
       if (columnTypePtr->isDecimal()) {
         const auto [decimalMin, decimalMax] =
-            getInt128BoundsForType(columnTypePtr);
+            getInt128BoundsForType(columnTypePtr, decimalType);
         return {
             static_cast<ValueT>(decimalMin), static_cast<ValueT>(decimalMax)};
       } else if constexpr (std::is_same_v<FilterT, common::HugeintRange>) {
@@ -186,13 +217,14 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
     const bool skipLowerBound = lower <= minBound;
     const bool skipUpperBound = upper >= maxBound;
 
+    if (upper < minBound || lower > maxBound) {
+      return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
+    }
+
     auto addLiteral = [&](ValueT value) -> const cudf::ast::expression& {
       variant veloxVariant = static_cast<NativeT>(value);
       const auto& literal = makeScalarAndLiteral<Kind>(
-          columnTypePtr,
-          veloxVariant,
-          scalars,
-          subfieldDecimalType(columnTypePtr));
+          columnTypePtr, veloxVariant, scalars, decimalType);
       return tree.push(literal);
     };
 
@@ -242,9 +274,10 @@ std::reference_wrapper<const cudf::ast::expression> buildBigintRangeExpr(
     cudf::ast::tree& tree,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
     const cudf::ast::expression& columnRef,
-    const TypePtr& columnTypePtr) {
+    const TypePtr& columnTypePtr,
+    std::optional<cudf::type_id> decimalType) {
   return buildIntegerRangeExpr<Kind, common::BigintRange>(
-      filter, tree, scalars, columnRef, columnTypePtr);
+      filter, tree, scalars, columnRef, columnTypePtr, decimalType);
 }
 
 std::reference_wrapper<const cudf::ast::expression> buildHugeintRangeExpr(
@@ -252,9 +285,10 @@ std::reference_wrapper<const cudf::ast::expression> buildHugeintRangeExpr(
     cudf::ast::tree& tree,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
     const cudf::ast::expression& columnRef,
-    const TypePtr& columnTypePtr) {
+    const TypePtr& columnTypePtr,
+    std::optional<cudf::type_id> decimalType) {
   return buildIntegerRangeExpr<TypeKind::HUGEINT, common::HugeintRange>(
-      filter, tree, scalars, columnRef, columnTypePtr);
+      filter, tree, scalars, columnRef, columnTypePtr, decimalType);
 }
 
 template <TypeKind Kind, typename FilterT, typename ValueT>
@@ -264,6 +298,7 @@ const cudf::ast::expression& buildValuesListExpr(
     const cudf::ast::expression& columnRef,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
     const TypePtr& columnTypePtr,
+    std::optional<cudf::type_id> decimalType,
     bool isNegated = false) {
   using Op = cudf::ast::ast_operator;
   using Operation = cudf::ast::operation;
@@ -275,12 +310,15 @@ const cudf::ast::expression& buildValuesListExpr(
 
   std::vector<const cudf::ast::expression*> exprVec;
   for (const auto& value : values) {
+    if constexpr (!std::is_same_v<ValueT, StringView>) {
+      if (!decimalValueIsRepresentable(
+              value, columnTypePtr, decimalType)) {
+        continue;
+      }
+    }
     variant veloxVariant = static_cast<ValueT>(value);
     auto const& literal = tree.push(makeScalarAndLiteral<Kind>(
-        columnTypePtr,
-        veloxVariant,
-        scalars,
-        subfieldDecimalType(columnTypePtr)));
+        columnTypePtr, veloxVariant, scalars, decimalType));
     if (isNegated) {
       auto const& notEqualExpr =
           tree.push(Operation{Op::NOT_EQUAL, columnRef, literal});
@@ -291,13 +329,16 @@ const cudf::ast::expression& buildValuesListExpr(
     }
   }
 
+  if (exprVec.empty()) {
+    return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
+  }
+
   const cudf::ast::expression* result = exprVec[0];
   for (size_t i = 1; i < exprVec.size(); ++i) {
-    result = &tree.push(
-        Operation{
-            isNegated ? Op::NULL_LOGICAL_AND : Op::NULL_LOGICAL_OR,
-            *result,
-            *exprVec[i]});
+    result = &tree.push(Operation{
+        isNegated ? Op::NULL_LOGICAL_AND : Op::NULL_LOGICAL_OR,
+        *result,
+        *exprVec[i]});
   }
 
   return *result;
@@ -340,7 +381,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
     const cudf::ast::expression& columnRef,
     rmm::cuda_stream_view /*stream*/,
     rmm::device_async_resource_ref /*mr*/,
-    const TypePtr& columnTypePtr) {
+    const TypePtr& columnTypePtr,
+    std::optional<cudf::type_id> decimalType) {
   using NativeT = typename TypeTraits<Kind>::NativeType;
 
   if constexpr (std::is_integral_v<NativeT>) {
@@ -360,13 +402,14 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
         // Skip values that cannot be represented in the column type.
         continue;
       }
+      if (!decimalValueIsRepresentable(
+              value, columnTypePtr, decimalType)) {
+        continue;
+      }
 
       variant veloxVariant = static_cast<NativeT>(value);
       const auto& literal = makeScalarAndLiteral<Kind>(
-          columnTypePtr,
-          veloxVariant,
-          scalars,
-          subfieldDecimalType(columnTypePtr));
+          columnTypePtr, veloxVariant, scalars, decimalType);
       auto const& cudfLiteral = tree.push(literal);
       exprVec.push_back(&buildEqualityExpr(
           tree, columnRef, cudfLiteral, columnTypePtr->isDecimal()));
@@ -397,7 +440,8 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
     const common::Filter& filter,
     cudf::ast::tree& tree,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
-    const RowTypePtr& inputRowSchema) {
+    const RowTypePtr& inputRowSchema,
+    const SubfieldFilterDecimalTypes* decimalTypes) {
   // First, create column reference from subfield
   // For now, only support simple field references
   if (subfield.path().empty() ||
@@ -426,6 +470,8 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
   switch (filter.kind()) {
     case common::FilterKind::kBigintRange: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
+      const auto decimalType =
+          subfieldDecimalType(columnType, fieldName, decimalTypes);
       auto result = VELOX_DYNAMIC_TYPE_DISPATCH(
           buildBigintRangeExpr,
           columnType->kind(),
@@ -433,27 +479,34 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
           tree,
           scalars,
           columnRef,
-          columnType);
+          columnType,
+          decimalType);
       return result.get();
     }
 
     case common::FilterKind::kHugeintRange: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
-      auto const& expr =
-          buildHugeintRangeExpr(filter, tree, scalars, columnRef, columnType);
+      const auto decimalType =
+          subfieldDecimalType(columnType, fieldName, decimalTypes);
+      auto const& expr = buildHugeintRangeExpr(
+          filter, tree, scalars, columnRef, columnType, decimalType);
       return expr.get();
     }
 
     case common::FilterKind::kBigintValuesUsingHashTable: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
+      const auto decimalType =
+          subfieldDecimalType(columnType, fieldName, decimalTypes);
       return buildValuesListExpr<
           TypeKind::BIGINT,
           common::BigintValuesUsingHashTable,
-          int64_t>(filter, tree, columnRef, scalars, columnType);
+          int64_t>(filter, tree, columnRef, scalars, columnType, decimalType);
     }
 
     case common::FilterKind::kBigintValuesUsingBitmask: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
+      const auto decimalType =
+          subfieldDecimalType(columnType, fieldName, decimalTypes);
       // Dispatch by the column's integer kind and cast filter values to it.
       auto result = VELOX_DYNAMIC_TYPE_DISPATCH(
           buildIntegerInListExpr,
@@ -464,16 +517,19 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
           columnRef,
           stream,
           mr,
-          columnType);
+          columnType,
+          decimalType);
       return result.get();
     }
 
     case common::FilterKind::kHugeintValuesUsingHashTable: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
+      const auto decimalType =
+          subfieldDecimalType(columnType, fieldName, decimalTypes);
       return buildValuesListExpr<
           TypeKind::HUGEINT,
           common::HugeintValuesUsingHashTable,
-          int128_t>(filter, tree, columnRef, scalars, columnType);
+          int128_t>(filter, tree, columnRef, scalars, columnType, decimalType);
     }
 
     case common::FilterKind::kBytesValues: {
@@ -481,7 +537,8 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
       return buildValuesListExpr<
           TypeKind::VARCHAR,
           common::BytesValues,
-          StringView>(filter, tree, columnRef, scalars, columnType);
+          StringView>(
+          filter, tree, columnRef, scalars, columnType, std::nullopt);
     }
 
     case common::FilterKind::kNegatedBytesValues: {
@@ -489,7 +546,8 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
       return buildValuesListExpr<
           TypeKind::VARCHAR,
           common::NegatedBytesValues,
-          StringView>(filter, tree, columnRef, scalars, columnType, true);
+          StringView>(
+          filter, tree, columnRef, scalars, columnType, std::nullopt, true);
     }
 
     case common::FilterKind::kDoubleRange: {
@@ -509,13 +567,11 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
     case common::FilterKind::kBoolValue: {
       auto* boolValue = static_cast<const common::BoolValue*>(&filter);
       auto matchesTrue = boolValue->testBool(true);
-      scalars.emplace_back(
-          std::make_unique<cudf::numeric_scalar<bool>>(
-              matchesTrue, true, stream, mr));
+      scalars.emplace_back(std::make_unique<cudf::numeric_scalar<bool>>(
+          matchesTrue, true, stream, mr));
       stream.synchronize();
-      auto const& matchesBoolExpr = tree.push(
-          cudf::ast::literal{
-              *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
+      auto const& matchesBoolExpr = tree.push(cudf::ast::literal{
+          *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
       return tree.push(Operation{Op::EQUAL, columnRef, matchesBoolExpr});
     }
 
@@ -551,7 +607,7 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
       exprRefs.reserve(subFilters.size());
       for (const auto* subFilter : subFilters) {
         auto const& subExpr = createAstFromSubfieldFilter(
-            subfield, *subFilter, tree, scalars, inputRowSchema);
+            subfield, *subFilter, tree, scalars, inputRowSchema, decimalTypes);
         exprRefs.push_back(&subExpr);
       }
 
@@ -576,7 +632,8 @@ cudf::ast::expression const& createAstFromSubfieldFilters(
     const common::SubfieldFilters& subfieldFilters,
     cudf::ast::tree& tree,
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
-    const RowTypePtr& inputRowSchema) {
+    const RowTypePtr& inputRowSchema,
+    const SubfieldFilterDecimalTypes* decimalTypes) {
   using Op = cudf::ast::ast_operator;
   using Operation = cudf::ast::operation;
 
@@ -588,7 +645,7 @@ cudf::ast::expression const& createAstFromSubfieldFilters(
       continue;
     }
     auto const& expr = createAstFromSubfieldFilter(
-        subfield, *filterPtr, tree, scalars, inputRowSchema);
+        subfield, *filterPtr, tree, scalars, inputRowSchema, decimalTypes);
     exprRefs.push_back(&expr);
   }
 

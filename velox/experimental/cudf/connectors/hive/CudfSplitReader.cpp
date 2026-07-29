@@ -92,7 +92,8 @@ CudfSplitReader::CudfSplitReader(
       pool_(connectorQueryCtx->memoryPool()),
       useExperimentalCudfReader_(useExperimentalCudfReader),
       baseReaderOpts_(pool_),
-      subfieldFilterExpr_(subfieldFilterExpr) {
+      subfieldFilterExpr_(subfieldFilterExpr),
+      pushdownFilterExpr_(subfieldFilterExpr) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
 }
@@ -222,8 +223,12 @@ void CudfSplitReader::resetSplit() {
   fileMetaData_.clear();
 }
 
-cudf::ast::expression const* CudfSplitReader::subfieldFilter() {
+cudf::ast::expression const* CudfSplitReader::subfieldFilter() const {
   return subfieldFilterExpr_;
+}
+
+cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {
+  return pushdownFilterExpr_;
 }
 
 void CudfSplitReader::setupCudfDataSource() {
@@ -344,7 +349,7 @@ void CudfSplitReader::setupReaderOptions() {
     readerOptions_.set_num_bytes(split_->size());
   }
 
-  if (auto* filter = subfieldFilter(); filter != nullptr) {
+  if (auto* filter = pushdownFilter(); filter != nullptr) {
     readerOptions_.set_filter(*filter);
   }
 
@@ -379,6 +384,14 @@ void CudfSplitReader::fileMetaDatas() {
       fileMetaData_.size(),
       1,
       "CudfSplitReader failed to read any parquet metadatas");
+
+  if (pushdownFilterBuilder_) {
+    VELOX_CHECK_EQ(
+        fileMetaData_.size(),
+        1,
+        "Split-specific subfield filters require exactly one parquet metadata");
+    pushdownFilterExpr_ = pushdownFilterBuilder_(fileMetaData_.front());
+  }
 }
 
 void CudfSplitReader::createCudfReader() {
