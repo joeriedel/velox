@@ -53,14 +53,14 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit 4302ee8 from 2026-06-24
+# kjmph/cudf commit based on 4302ee8 with hash-partition concurrency diagnostics
 set(VELOX_cudf_VERSION 26.08 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 4302ee801ecb2ce9edce9c75f8a5ee9efa0bceb9)
+set(VELOX_cudf_COMMIT 6229a9bc4775f60d555d6d43fdbebd37079b8704)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  d66e580e12a5265ef2e96768678de22862471023a50fca0c68ea5daaa684e0e1
+  d326ee7b2441db3fcd34c47c406ac81290ec6eb27deb74f4fb7e6f0ca94e47b8
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install. The variables are used only to gate ucxx
@@ -99,11 +99,10 @@ block(SCOPE_FOR VARIABLES)
   # TODO(mh,bd): Remove this once we have a permanent solution for the spdlog/fmt
   # incompatibility.
 
-  # cuDF (via rapids_logger) pins spdlog 1.14.1, which is incompatible with
-  # the fmt 11.2.0 that Velox builds. Override the rapids-cmake/CPM spdlog
-  # version to 1.15.3, which is fmt 11.2 compatible.
+  # Override cuDF's RAPIDS-CMake dependencies with the custom CCCL scan fix and
+  # spdlog 1.15.3, which is compatible with the fmt 11.2.0 that Velox builds.
   # RAPIDS_CMAKE_CPM_OVERRIDE_VERSION_FILE is honored by every rapids_cpm_init,
-  # so the override applies before rapids_logger fetches spdlog.
+  # so both overrides apply before cuDF resolves either dependency.
   set(RAPIDS_CMAKE_CPM_OVERRIDE_VERSION_FILE "${CMAKE_CURRENT_LIST_DIR}/cudf-cpm-overrides.json")
 
   FetchContent_Declare(

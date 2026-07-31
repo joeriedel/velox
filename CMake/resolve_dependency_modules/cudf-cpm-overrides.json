@@ -1,5 +1,10 @@
 {
   "packages": {
+    "CCCL": {
+      "version": "3.4.0",
+      "url": "https://github.com/kjmph/cccl/archive/114f345ff2de6fbc704e3d46b1ddc8d23d512c60.tar.gz",
+      "url_hash": "SHA256=0d0b76bd78e605f237c78682b34b580ceccc7edc3b39fd5fa5388029f94c027e"
+    },
     "spdlog": {
       "version": "1.15.3",
       "git_url": "https://github.com/gabime/spdlog.git",
