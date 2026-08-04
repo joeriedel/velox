@@ -45,11 +45,18 @@ class CudaEvent;
 /// Thread-safety: All methods use mutex locking for concurrent access.
 class CudfNestedLoopJoinBridge : public exec::JoinBridge {
  public:
-  // Build data: single concatenated build-side table. NLJ requires a single
-  // table because the cross-join output is probe_rows × build_rows — batching
-  // the build side does not prevent output overflow, so we enforce a single
-  // table and fail early if the build side exceeds cudf::size_type limits.
-  using build_data_type = std::shared_ptr<cudf::table>;
+  struct BuildData {
+    std::shared_ptr<cudf::table> table;
+    cudf::size_type numRows;
+  };
+
+  // Build data: single concatenated build-side table and its logical row
+  // count. cuDF tables with zero columns report zero rows, so the row count
+  // must be retained separately. NLJ requires a single table because the
+  // cross-join output is probe_rows × build_rows — batching the build side
+  // does not prevent output overflow, so we enforce a single table and fail
+  // early if the build side exceeds cudf::size_type limits.
+  using build_data_type = std::shared_ptr<const BuildData>;
 
   void setData(std::optional<build_data_type> data);
 

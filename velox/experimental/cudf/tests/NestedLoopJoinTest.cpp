@@ -1590,8 +1590,53 @@ TEST_F(CudfNestedLoopJoinTest, emptyBuildConsumeInput) {
   ASSERT_EQ(inputPositions, 300);
 }
 
-// TODO: Zero-column build side is not yet supported. cudf::table with zero
-// columns reports num_rows() == 0, causing the operator to treat a non-empty
-// build as empty. Fixing this requires the bridge to carry row counts
-// separately. See CPU NestedLoopJoinTest::zeroColumnBuild for the expected
-// behavior.
+// Cross join with a build side that has rows, but no columns. cuDF tables with
+// zero columns cannot represent their row count, so the join bridge retains
+// the logical build cardinality separately.
+TEST_F(CudfNestedLoopJoinTest, zeroColumnBuild) {
+  auto probeVectors = {
+      makeRowVector({sequence<int32_t>(10)}),
+      makeRowVector({sequence<int32_t>(100, 10)}),
+      makeRowVector({sequence<int32_t>(1'000, 10 + 100)}),
+      makeRowVector({sequence<int32_t>(7, 10 + 100 + 1'000)}),
+  };
+
+  auto buildVectors = {
+      makeRowVector({sequence<int32_t>(1)}),
+      makeRowVector({sequence<int32_t>(4, 1)})};
+
+  createDuckDbTable("t", {probeVectors});
+
+  // Build side has more than one row.
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .project({})
+                          .planNode(),
+                      {"c0"})
+                  .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT t.* FROM t, "
+      "(SELECT * FROM UNNEST (ARRAY[0, 1, 2, 3, 4])) u");
+
+  // Build side has exactly one row, matching the scalar-subquery shape used
+  // by TPC-DS Q9.
+  planNodeIdGenerator->reset();
+  plan = PlanBuilder(planNodeIdGenerator)
+             .values({probeVectors})
+             .nestedLoopJoin(
+                 PlanBuilder(planNodeIdGenerator)
+                     .values({buildVectors})
+                     .filter("c0 = 1")
+                     .project({})
+                     .planNode(),
+                 {"c0"})
+             .planNode();
+
+  assertQuery(plan, "SELECT * FROM t");
+}
