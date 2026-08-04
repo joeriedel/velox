@@ -21,6 +21,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/utilities/error.hpp>
@@ -106,8 +107,20 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
         tempMr);
     seenFilter_ = std::make_unique<cudf::filtered_join>(
         seenKeys_->view(), cudf::null_equality::EQUAL, stream);
+    stateStream_ = stream;
 
   } else {
+    VELOX_CHECK(stateStream_.has_value());
+    const auto previousStateStream = stateStream_.value();
+    const bool changedStreams = previousStateStream.value() != stream.value();
+    if (changedStreams) {
+      // The filter construction and any earlier probes are asynchronous on
+      // the previous state stream. Make this input stream wait before reading
+      // the persistent state.
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{previousStateStream}, stream);
+    }
+
     // Subsequent batch: probe the persistent filter — no hash table rebuild.
 
     // Gather the unique keys from this batch.
@@ -122,6 +135,8 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
     auto newKeyLocalIndices =
         seenFilter_->anti_join(uniqueBatchKeys->view(), stream, tempMr);
 
+    std::unique_ptr<cudf::table> nextSeenKeys;
+    std::unique_ptr<cudf::filtered_join> nextSeenFilter;
     if (!newKeyLocalIndices->is_empty()) {
       // Map local indices back to original batch row indices via gather.
       // Wrap device_uvector as column_view (same pattern as CudfHashJoin).
@@ -154,9 +169,26 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
       // concatenate-per-batch idiom.
       std::vector<cudf::table_view> seenPlusNew = {
           seenKeys_->view(), newKeys->view()};
-      seenKeys_ = cudf::concatenate(seenPlusNew, stream, tempMr);
-      seenFilter_ = std::make_unique<cudf::filtered_join>(
-          seenKeys_->view(), cudf::null_equality::EQUAL, stream);
+      nextSeenKeys = cudf::concatenate(seenPlusNew, stream, tempMr);
+      nextSeenFilter = std::make_unique<cudf::filtered_join>(
+          nextSeenKeys->view(), cudf::null_equality::EQUAL, stream);
+    }
+
+    if (changedStreams) {
+      // The anti-join and optional concatenate above read the old state on
+      // this input stream. Make the old state's allocation stream wait before
+      // its buffers or hash filter can be destroyed or reused.
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{stream}, previousStateStream);
+    }
+
+    if (nextSeenKeys) {
+      // filtered_join retains views into seenKeys_, so destroy the old filter
+      // before replacing its backing table.
+      seenFilter_.reset();
+      seenKeys_ = std::move(nextSeenKeys);
+      seenFilter_ = std::move(nextSeenFilter);
+      stateStream_ = stream;
     }
   }
 
