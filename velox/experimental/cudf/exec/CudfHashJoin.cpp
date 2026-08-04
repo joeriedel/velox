@@ -1071,9 +1071,13 @@ void CudfHashJoinProbe::doNoMoreInput() {
         if (peer.get() == operatorCtx_->driver()) {
           continue;
         }
-        auto op = peer->findOperator(planNodeId());
+        // CudfBatchConcat and CudfHashJoinProbe intentionally share the join
+        // plan-node ID. Locate the peer by operator ID so we get the probe,
+        // not the first operator with that plan-node ID.
+        auto op = peer->findOperator(operatorId());
         auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
-        if (probe != nullptr && probe->lastProbeStream_.has_value()) {
+        VELOX_CHECK_NOT_NULL(probe);
+        if (probe->lastProbeStream_.has_value()) {
           inputStreams.push_back(probe->lastProbeStream_.value());
         }
       }
@@ -1085,11 +1089,9 @@ void CudfHashJoinProbe::doNoMoreInput() {
         if (peer.get() == operatorCtx_->driver()) {
           continue;
         }
-        auto op = peer->findOperator(planNodeId());
+        auto op = peer->findOperator(operatorId());
         auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
-        if (probe == nullptr) {
-          continue;
-        }
+        VELOX_CHECK_NOT_NULL(probe);
         // Combine flags per partition using cuDF bitwise OR
         // DM: This needs a relook. This is for when build side exceeds cudf
         // size_type limits. In case of multiple right side chunks, I'm not sure
@@ -1117,7 +1119,7 @@ void CudfHashJoinProbe::doNoMoreInput() {
   // Handling RightSemiFilterJoin
   // Collect results from peers
   for (auto& peer : peers) {
-    auto op = peer->findOperator(planNodeId());
+    auto op = peer->findOperator(operatorId());
     auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
     VELOX_CHECK_NOT_NULL(probe);
     for (auto& input : probe->inputs_) {
