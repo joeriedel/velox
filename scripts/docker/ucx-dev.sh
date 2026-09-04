@@ -20,6 +20,13 @@
 #   scripts/docker/ucx-dev.sh enter   # start the container if needed, attach a zsh shell
 #   scripts/docker/ucx-dev.sh stop    # stop (and remove, via --rm) the container
 #   scripts/docker/ucx-dev.sh build   # stop the container, then rebuild the image
+#
+# `enter` also installs this repo's pre-commit hook (git config
+# core.hooksPath is unset, so this writes directly to .git/hooks/) using
+# the container's pre-commit/clang-format/etc. This is deliberate: `git
+# commit` from the host will fail (the hook hardcodes the container's
+# python3, which the host doesn't have `pre-commit` installed for) --
+# commit from inside the container.
 
 set -euo pipefail
 
@@ -73,6 +80,15 @@ function enter {
     # git (and clangd's query-driver, which shells out to git) doesn't
     # balk at it.
     podman exec "$CONTAINER" git config --system --add safe.directory "$REPO_ROOT"
+
+    # Activates the pre-commit hook (see .pre-commit-config.yaml and
+    # velox/experimental/ucx-exchange/README.md's "Code Formatting"
+    # section) so formatting runs on every commit. Writes to
+    # .git/hooks/pre-commit in the bind-mounted repo, so unlike the
+    # steps above this only needs to happen once per checkout -- it
+    # persists on the host across container recreations -- but re-running
+    # it here is cheap and keeps a fresh checkout working automatically.
+    podman exec "$CONTAINER" pre-commit install
   fi
   exec podman exec -it -e TERM="$TERM" -e COLORTERM="${COLORTERM:-}" "$CONTAINER" zsh
 }

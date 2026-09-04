@@ -112,6 +112,17 @@ RUN dnf install -y zsh ncurses-term glibc-langpack-en clang-tools-extra && \
       echo 'export CC=gcc CXX=g++'; \
     } >>/etc/zshrc
 
+# The pre-commit framework (see .pre-commit-config.yaml and
+# velox/experimental/ucx-exchange/README.md's "Code Formatting" section)
+# runs formatting/lint hooks on every commit. Installed globally (no
+# --user) so the `pre-commit` entrypoint lands on the default PATH
+# regardless of $HOME. Baked into the image, not installed at container
+# runtime, since the container itself is ephemeral (`--rm`) -- only
+# `pre-commit install`, run once per checkout against the bind-mounted
+# repo, needs to happen at container-start time (see ucx-dev.sh), because
+# that writes to the host repo's .git/hooks, which does persist.
+RUN pip3 install pre-commit
+
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
