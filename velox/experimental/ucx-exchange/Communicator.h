@@ -99,6 +99,25 @@ class Communicator {
   /// @param comms The element to be added to the work queue.
   void addToWorkQueue(std::shared_ptr<CommElement> comms);
 
+  /// @brief Registers an additional active-message receiver callback so a
+  /// transport can add its own handshake protocol alongside the built-in ones.
+  ///
+  /// Transports share this Communicator's single listener and are told apart
+  /// by active-message callback id -- kAmCallbackId for the cuDF path and
+  /// kAmCpuCallbackId for the CPU-row path. Rather than hard-coding a third,
+  /// this lets a transport supply its own without editing run().
+  ///
+  /// Must be called before run(), which is when callbacks are handed to the
+  /// worker. Registering the same id twice is an error, since two protocols
+  /// cannot share a dispatch slot.
+  ///
+  /// @param callbackId Identifier the peer sends its handshake under.
+  /// @param callback Invoked on the UCXX progress thread, so it must not
+  /// throw and must not block.
+  void registerAmCallback(
+      ucxx::AmReceiverCallbackIdType callbackId,
+      ucxx::AmReceiverCallbackType callback);
+
   /// @brief Unregisters a communication element
   /// @brief comms The communication element.
   void unregister(std::shared_ptr<CommElement> comms);
@@ -235,6 +254,15 @@ class Communicator {
 
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
+
+  // Active-message callbacks supplied by transports through
+  // registerAmCallback(), applied to the worker in run(). Guarded by
+  // amCallbacksMutex_ because registration happens on whatever thread starts
+  // the transport, before the progress thread exists.
+  std::mutex amCallbacksMutex_;
+  std::vector<
+      std::pair<ucxx::AmReceiverCallbackIdType, ucxx::AmReceiverCallbackType>>
+      amCallbacks_;
   std::shared_ptr<ucxx::Listener> listener_;
   // The UCX worker address is immutable after worker creation. Cache it while
   // starting the communicator so every CPU exchange handshake does not have

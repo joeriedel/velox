@@ -209,10 +209,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
-      replacement.push_back(std::make_unique<UcxExchange>(
-          op->operatorId(), ctx, mergeExchangeNode, nullptr));
-      replacement.push_back(std::make_unique<cudf_velox::CudfOrderBy>(
-          op->operatorId(), ctx, mergeExchangeNode));
+      replacement.push_back(
+          std::make_unique<UcxExchange>(
+              op->operatorId(), ctx, mergeExchangeNode, nullptr));
+      replacement.push_back(
+          std::make_unique<cudf_velox::CudfOrderBy>(
+              op->operatorId(), ctx, mergeExchangeNode));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       VLOG(1) << "[CUDF-UCX] replacing MergeExchange at index " << i
@@ -233,11 +235,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
-      replacement.push_back(std::make_unique<UcxExchange>(
-          op->operatorId(),
-          ctx,
-          exchangeNode,
-          getOrCreateExchangeClient(exchangeOp, op, ctx)));
+      replacement.push_back(
+          std::make_unique<UcxExchange>(
+              op->operatorId(),
+              ctx,
+              exchangeNode,
+              getOrCreateExchangeClient(exchangeOp, op, ctx)));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       VLOG(1) << "[CUDF-UCX] replacing Exchange at index " << i
@@ -309,6 +312,14 @@ void registerCudfUcxDriverAdapter() {
       /*inspect=*/{},
       &adaptDriver};
   exec::DriverFactory::registerAdapter(std::move(adapter));
+
+  // Registering the receive adapter without the output transport leaves
+  // TransportKind::kUcx unresolvable, so a plan naming it fails in
+  // Task::initializePartitionOutput. startCudfUcxExchange() does both; doing
+  // them together here lets a caller that already has a communicator running
+  // register without starting a second one. Idempotent.
+  registerCudfUcxOutputTransport();
+
   LOG(INFO) << "[CUDF-UCX] DriverAdapter registered";
 }
 

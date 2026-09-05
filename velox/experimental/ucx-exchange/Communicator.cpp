@@ -382,6 +382,19 @@ void Communicator::run() {
   worker_->registerAmReceiverCallback(
       cpuInfo, &UcxCpuRowAcceptor::cStyleAMCallback);
 
+  // Callbacks supplied by transports through registerAmCallback(). Applied
+  // here because this is where the worker exists; a transport registers
+  // before run() is called.
+  {
+    std::lock_guard<std::mutex> lock(amCallbacksMutex_);
+    for (auto& [callbackId, callback] : amCallbacks_) {
+      ucxx::AmReceiverCallbackInfo extraInfo(kAmCallbackOwner, callbackId);
+      worker_->registerAmReceiverCallback(extraInfo, callback);
+      LOG(INFO) << "Communicator registered transport active-message callback "
+                << static_cast<uint64_t>(callbackId);
+    }
+  }
+
   // The thread that called run() owns CommElement::process() /
   // state-machine dispatch. The UCXX progress thread owns worker progress and
   // callback execution so callbacks have one producer thread.
@@ -606,6 +619,29 @@ void Communicator::signalWorker() {
   if (worker_ && UcxConfigView::ucxxBlockingPolling()) {
     worker_->signal();
   }
+}
+
+void Communicator::registerAmCallback(
+    ucxx::AmReceiverCallbackIdType callbackId,
+    ucxx::AmReceiverCallbackType callback) {
+  VELOX_CHECK(callback != nullptr, "Active-message callback is null");
+  VELOX_CHECK_NE(
+      callbackId,
+      kAmCallbackId,
+      "Active-message callback id is reserved for the cuDF exchange");
+  VELOX_CHECK_NE(
+      callbackId,
+      kAmCpuCallbackId,
+      "Active-message callback id is reserved for the CPU-row exchange");
+
+  std::lock_guard<std::mutex> lock(amCallbacksMutex_);
+  for (const auto& [existingId, unused] : amCallbacks_) {
+    VELOX_CHECK_NE(
+        existingId,
+        callbackId,
+        "Active-message callback id is already registered");
+  }
+  amCallbacks_.emplace_back(callbackId, std::move(callback));
 }
 
 void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {

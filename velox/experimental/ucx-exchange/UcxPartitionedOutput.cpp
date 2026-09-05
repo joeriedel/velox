@@ -14,17 +14,21 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
+
 #include <fmt/format.h>
 #include <glog/logging.h>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/CudfPackedPage.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
@@ -114,6 +118,36 @@ std::unique_ptr<cudf::column> createKeyNullMask(
   }
   return result;
 }
+} // namespace
+
+namespace {
+
+// True when the operator should write to the ordinary output buffer instead of
+// the transport's own queue. Read once; this selects a wiring, not a per-batch
+// decision.
+bool useStockOutputBuffer() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("VELOX_UCX_STOCK_OUTPUT_BUFFER");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
+// Keeps the packed columns alive while any IOBuf segment still refers to their
+// memory. Each segment holds one shared_ptr copy, released by the free
+// function once the buffer and the transport are done with it.
+using PackedHolder = std::shared_ptr<cudf::packed_columns>;
+
+void releasePackedHolder(void* /*buf*/, void* userData) {
+  delete static_cast<PackedHolder*>(userData);
+}
+
+std::unique_ptr<folly::IOBuf>
+wrapRegion(void* data, size_t size, const PackedHolder& holder) {
+  return folly::IOBuf::takeOwnership(
+      data, size, releasePackedHolder, new PackedHolder{holder});
+}
+
 } // namespace
 
 // Computes a mapping from names in n2 to names in n1
@@ -221,7 +255,9 @@ void UcxPartitionedOutput::recordAllocationPressure(uint64_t waitBytes) {
     return;
   }
   auto queueManager = sharedQueueManager();
-  queueManager->recordFullTransferCongestion(this->taskId());
+  if (!useStockOutputBuffer()) {
+    queueManager->recordFullTransferCongestion(this->taskId());
+  }
 
   const auto destinationBaseBytes = std::max<uint64_t>(
       initialPayloadBytes_,
@@ -231,17 +267,20 @@ void UcxPartitionedOutput::recordAllocationPressure(uint64_t waitBytes) {
   const auto clampedBaseBytes = static_cast<int64_t>(std::min<uint64_t>(
       destinationBaseBytes,
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
-  for (size_t partition = 0; partition < numPartitions_; ++partition) {
-    queueManager->recordTransferCongestion(
-        this->taskId(), partition, clampedBaseBytes);
+  if (!useStockOutputBuffer()) {
+    for (size_t partition = 0; partition < numPartitions_; ++partition) {
+      queueManager->recordTransferCongestion(
+          this->taskId(), partition, clampedBaseBytes);
+    }
   }
 
   const auto clampedWaitBytes = static_cast<int64_t>(std::min<uint64_t>(
       std::max<uint64_t>(waitBytes, 1),
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
-  if (queueManager->waitForFullTransferCapacity(
-          this->taskId(), clampedWaitBytes, &future_) ||
-      queueManager->checkBlocked(this->taskId(), &future_)) {
+  const bool awaitingCapacity = !useStockOutputBuffer() &&
+      queueManager->waitForFullTransferCapacity(
+          this->taskId(), clampedWaitBytes, &future_);
+  if (awaitingCapacity || queueBlocked(&future_)) {
     blockingReason_ = exec::BlockingReason::kWaitForConsumer;
     return;
   }
@@ -322,12 +361,13 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
             input.tableView,
             input.stream,
             cudf::get_current_device_resource_ref());
-        payloads.push_back(EmptyPayload{
-            destination,
-            static_cast<int32_t>(numRows),
-            std::make_unique<cudf::packed_columns>(
-                std::move(packedCols.metadata),
-                std::move(packedCols.gpu_data))});
+        payloads.push_back(
+            EmptyPayload{
+                destination,
+                static_cast<int32_t>(numRows),
+                std::make_unique<cudf::packed_columns>(
+                    std::move(packedCols.metadata),
+                    std::move(packedCols.gpu_data))});
       };
 
       if (kind_ != core::PartitionedOutputNode::Kind::kPartitioned ||
@@ -347,8 +387,8 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
       // enqueue.
       for (auto& payload : payloads) {
         try {
-          queueManager->enqueue(
-              this->taskId(),
+          enqueuePacked(
+              queueManager,
               payload.destination,
               std::move(payload.packedColumns),
               payload.numRows);
@@ -364,7 +404,7 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
       }
 
       pendingInputBatch_.reset();
-      const auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
+      const auto blocked = queueBlocked(&future_);
       blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
                                 : exec::BlockingReason::kNotBlocked;
       return;
@@ -392,11 +432,10 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
     input.stream.synchronize();
     auto packedColsPtr = std::make_unique<cudf::packed_columns>(
         std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-    queueManager->enqueue(
-        this->taskId(), 0, std::move(packedColsPtr), input.numRows);
+    enqueuePacked(queueManager, 0, std::move(packedColsPtr), input.numRows);
 
     pendingInputBatch_.reset();
-    const auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
+    const auto blocked = queueBlocked(&future_);
     blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
                               : exec::BlockingReason::kNotBlocked;
   } catch (const std::bad_alloc&) {
@@ -468,13 +507,14 @@ void UcxPartitionedOutput::flushPending() {
       tableView = mergedTable->view();
     }
 
-    pendingInputBatch_.emplace(PendingInputBatch{
-        std::move(mergedTable),
-        std::move(vectorOwners),
-        tableView,
-        numRows,
-        estimatedBytes,
-        stream});
+    pendingInputBatch_.emplace(
+        PendingInputBatch{
+            std::move(mergedTable),
+            std::move(vectorOwners),
+            tableView,
+            numRows,
+            estimatedBytes,
+            stream});
     pendingRows_ = 0;
     pendingBytes_ = 0;
     partitionPendingInputBatch();
@@ -495,8 +535,7 @@ exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
   if (shouldDrainPending()) {
     return exec::BlockingReason::kNotBlocked;
   }
-  if (!finished_ &&
-      sharedQueueManager()->checkBlocked(this->taskId(), future)) {
+  if (!finished_ && queueBlocked(future)) {
     return exec::BlockingReason::kWaitForConsumer;
   }
   return exec::BlockingReason::kNotBlocked;
@@ -518,7 +557,15 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
     }
   }
   if (noMoreInput_) {
-    sharedQueueManager()->noMoreData(this->taskId());
+    // End of stream goes to whichever buffer received the pages. Sending it to
+    // the transport queue while the pages went to the stock buffer leaves the
+    // consumer waiting for an end marker that never arrives.
+    if (useStockOutputBuffer()) {
+      exec::DefaultOutputBufferManager::getInstanceRef()->noMoreData(
+          this->taskId());
+    } else {
+      sharedQueueManager()->noMoreData(this->taskId());
+    }
     finished_ = true;
   }
   return nullptr;
@@ -534,6 +581,58 @@ bool UcxPartitionedOutput::isFinished() {
 void UcxPartitionedOutput::close() {
   clearPending();
   Operator::close();
+}
+
+bool UcxPartitionedOutput::queueBlocked(ContinueFuture* future) {
+  if (useStockOutputBuffer()) {
+    // enqueue() already reported fullness through the future it handed back,
+    // so there is no separate capacity to consult.
+    return false;
+  }
+  return sharedQueueManager()->checkBlocked(this->taskId(), future);
+}
+
+void UcxPartitionedOutput::enqueuePacked(
+    const std::shared_ptr<UcxOutputQueueManager>& queueManager,
+    int destination,
+    std::unique_ptr<cudf::packed_columns> packedColumns,
+    int32_t numRows) {
+  if (useStockOutputBuffer()) {
+    enqueuePackedToStockBuffer(destination, std::move(packedColumns), numRows);
+    return;
+  }
+  queueManager->enqueue(
+      this->taskId(), destination, std::move(packedColumns), numRows);
+}
+
+void UcxPartitionedOutput::enqueuePackedToStockBuffer(
+    int destination,
+    std::unique_ptr<cudf::packed_columns> packedColumns,
+    int32_t numRows) {
+  auto manager = exec::DefaultOutputBufferManager::getInstanceRef();
+  VELOX_CHECK_NOT_NULL(manager, "No output buffer manager");
+
+  // The page keeps the packed table and renders when it is read, so nothing
+  // here decides whether this output leaves as device memory or host bytes.
+  // Whoever asks for it decides, which is the only point at which the reader
+  // is known.
+  auto page = std::make_unique<CudfPackedPage>(
+      std::move(packedColumns),
+      this->taskId(),
+      destination,
+      numRows,
+      asRowType(outputType_),
+      pool());
+
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  const bool blocked =
+      manager->enqueue(this->taskId(), destination, std::move(page), &future);
+  if (blocked) {
+    // Same backpressure contract as the transport queue: the buffer is full
+    // and the consumer must drain before more is produced.
+    future_ = std::move(future);
+    blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+  }
 }
 
 std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
@@ -688,19 +787,20 @@ void UcxPartitionedOutput::hashPartition(
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
 
   auto partitionedView = partitionedTable->view();
-  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
-      std::move(partitionedTable),
-      {},
-      partitionedView,
-      std::move(partitionOffsets),
-      estimatedBytes,
-      false,
-      stream,
-      0,
-      {},
-      {},
-      {},
-      0});
+  pendingPartitionedBatch_.emplace(
+      PendingPartitionedBatch{
+          std::move(partitionedTable),
+          {},
+          partitionedView,
+          std::move(partitionOffsets),
+          estimatedBytes,
+          false,
+          stream,
+          0,
+          {},
+          {},
+          {},
+          0});
 }
 
 void UcxPartitionedOutput::enqueueReplicatedNullRows(
@@ -721,11 +821,11 @@ void UcxPartitionedOutput::enqueueReplicatedNullRows(
     stream.synchronize();
     auto packedColsPtr = std::make_unique<cudf::packed_columns>(
         std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-    queueManager->enqueue(
-        this->taskId(),
+    enqueuePacked(
+        queueManager,
         partition,
         std::move(packedColsPtr),
-        nullRows.num_rows());
+        static_cast<int32_t>(nullRows.num_rows()));
   }
 }
 
@@ -747,19 +847,20 @@ void UcxPartitionedOutput::equalPartition(
   }
   offsets.push_back(size);
 
-  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
-      std::move(tableOwner),
-      std::move(vectorOwners),
-      tableView,
-      std::move(offsets),
-      estimatedBytes,
-      false,
-      stream,
-      0,
-      {},
-      {},
-      {},
-      0});
+  pendingPartitionedBatch_.emplace(
+      PendingPartitionedBatch{
+          std::move(tableOwner),
+          std::move(vectorOwners),
+          tableView,
+          std::move(offsets),
+          estimatedBytes,
+          false,
+          stream,
+          0,
+          {},
+          {},
+          {},
+          0});
 }
 
 // Estimate payload bytes for a partition using the reservation estimate. The
@@ -880,6 +981,11 @@ uint64_t UcxPartitionedOutput::transferWindowBytes(
     return baseWindow;
   }
 
+  if (useStockOutputBuffer()) {
+    // The stock buffer has no transfer window; its own size limit is what
+    // bounds how much is outstanding.
+    return baseWindow;
+  }
   return static_cast<uint64_t>(queueManager->transferWindowBytes(
       this->taskId(),
       destination,
@@ -942,6 +1048,9 @@ bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
   auto queueManager = sharedQueueManager();
   auto recordContiguousSplitPressure = [&]() {
     batch.conservativeChunkSizing = true;
+    if (useStockOutputBuffer()) {
+      return;
+    }
     queueManager->recordFullTransferCongestion(this->taskId());
     for (size_t partition = 0; partition < numPartitions_; ++partition) {
       if (batch.offsets[partition] < batch.offsets[partition + 1]) {
@@ -1509,10 +1618,11 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
 
         std::optional<cudf::packed_columns> packedCols;
         try {
-          packedCols.emplace(cudf::pack(
-              tableSlices[0],
-              batch.stream,
-              cudf::get_current_device_resource_ref()));
+          packedCols.emplace(
+              cudf::pack(
+                  tableSlices[0],
+                  batch.stream,
+                  cudf::get_current_device_resource_ref()));
         } catch (const std::bad_alloc&) {
           recordChunkAllocationPressure(transferReservationBytes);
           return false;

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(podman run *)",
+      "Bash(git log *)",
+      "Bash(gh api *)",
+      "Read(//home/jriedel/projects/podman/cuda/**)",
+      "Read(//home/jriedel/projects/**)"
+    ]
+  }
+}

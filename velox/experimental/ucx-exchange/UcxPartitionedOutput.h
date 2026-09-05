@@ -129,6 +129,35 @@ class UcxPartitionedOutput : public exec::Operator,
     rmm::cuda_stream_view stream;
   };
 
+  // Hands one packed batch to whichever output buffer is in use.
+  //
+  // The packing above is the same either way -- the data is on the device
+  // because the plan is a cuDF plan, which has nothing to do with how it is
+  // then moved. What differs is only the destination: the transport-owned
+  // queue, or the ordinary output buffer that every other Velox producer
+  // writes to. Writing to the latter is what lets a transport read a
+  // producer's output without the producer being built for that transport.
+  void enqueuePacked(
+      const std::shared_ptr<UcxOutputQueueManager>& queueManager,
+      int destination,
+      std::unique_ptr<cudf::packed_columns> packedColumns,
+      int32_t numRows);
+
+  // Enqueues into the stock OutputBufferManager, representing the packed
+  // columns as an IOBuf chain of [host metadata][device data]. IOBuf
+  // describes memory without dereferencing it, so the device pointer travels
+  // through the ordinary buffer untouched.
+  // Backpressure, asked of whichever buffer is in use. The transport queue
+  // has its own capacity accounting; the stock buffer reports fullness
+  // through the future enqueue() hands back, which enqueuePackedToStockBuffer
+  // already captures, so there is nothing further to ask it.
+  bool queueBlocked(ContinueFuture* future);
+
+  void enqueuePackedToStockBuffer(
+      int destination,
+      std::unique_ptr<cudf::packed_columns> packedColumns,
+      int32_t numRows);
+
   void partitionPendingInputBatch();
 
   bool drainPendingPartitionedBatch();

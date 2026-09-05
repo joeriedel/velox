@@ -20,6 +20,11 @@ set(
   Communicator.cpp
   EndpointRef.cpp
   NetUtil.cpp
+  AutoAcceptor.cpp
+  AutoUcxClient.cpp
+  AutoExchangeServer.cpp
+  AutoExchangeSource.cpp
+  OutputBufferReader.cpp
   UcxExchangeProtocol.cpp
   UcxCpuRowMetadataMsg.cpp
   UcxCpuRowQueues.cpp
@@ -36,6 +41,10 @@ set(
 
 set(
   UCX_EXCHANGE_CUDF_SOURCES
+  CudfPackedExchange.cpp
+  CudfPackedOutput.cpp
+  CudfPackedPage.cpp
+  DevicePageReaders.cpp
   UcxCudfDriverAdapter.cpp
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp
